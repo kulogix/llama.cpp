@@ -1,4 +1,6 @@
+#ifdef HAS_F16
 enable f16;
+#endif
 
 #ifdef SRC_F32
 #define SRC_TYPE f32

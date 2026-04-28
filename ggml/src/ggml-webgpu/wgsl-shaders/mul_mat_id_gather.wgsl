@@ -1,4 +1,6 @@
+#ifdef HAS_F16
 enable f16;
+#endif
 
 struct MulMatIdGatherParams {
     offset_ids: u32,

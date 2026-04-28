@@ -1,4 +1,6 @@
+#ifdef HAS_F16
 enable f16;
+#endif
 enable subgroups;
 
 #define HEAD_DIM_QK 64

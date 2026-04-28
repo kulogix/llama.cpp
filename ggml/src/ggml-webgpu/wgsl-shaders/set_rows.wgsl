@@ -1,4 +1,6 @@
+#ifdef HAS_F16
 enable f16;
+#endif
 
 #ifdef DST_F32
 #define DST_INNER_TYPE f32

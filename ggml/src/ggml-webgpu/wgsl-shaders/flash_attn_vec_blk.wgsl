@@ -1,5 +1,7 @@
 diagnostic(off, subgroup_uniformity);
+#ifdef HAS_F16
 enable f16;
+#endif
 
 #define KV_TILE 32
 #define WG_SIZE 32

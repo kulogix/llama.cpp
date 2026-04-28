@@ -1,4 +1,6 @@
+#ifdef HAS_F16
 enable f16;
+#endif
 
 #define DECLARE_BYTE_LOADERS_SRC0
 #include "common_decls.tmpl"

@@ -925,9 +925,21 @@ struct ggml_webgpu_soft_max_pipeline_key_hash {
     }
 };
 
+// Build preprocessor options that pre-define HAS_F16 when the adapter supports it.
+// Threaded through every preprocess() call automatically via the Preprocessor's
+// global_macros, so individual get_X_pipeline methods do not need to know about it.
+static inline pre_wgsl::Options ggml_webgpu_make_preproc_opts(bool has_f16) {
+    pre_wgsl::Options opts;
+    if (has_f16) {
+        opts.macros.push_back("HAS_F16");
+    }
+    return opts;
+}
+
 class ggml_webgpu_shader_lib {
     wgpu::Device           device;
     pre_wgsl::Preprocessor preprocessor;
+    bool                   has_f16_ = false;
 
     std::unordered_map<int, webgpu_pipeline> sum_rows_pipelines;       // key is fixed, no variants yet
     std::unordered_map<int, webgpu_pipeline> argmax_pipelines;         // key is vec4
@@ -1003,7 +1015,10 @@ class ggml_webgpu_shader_lib {
         rms_norm_mul_pipelines;
 
   public:
-    ggml_webgpu_shader_lib(wgpu::Device device) { this->device = device; }
+    ggml_webgpu_shader_lib(wgpu::Device device, bool has_f16)
+        : device(device), preprocessor(ggml_webgpu_make_preproc_opts(has_f16)), has_f16_(has_f16) {}
+
+    bool has_f16() const { return has_f16_; }
 
     webgpu_pipeline get_sum_rows_pipeline(const ggml_webgpu_shader_lib_context & context) {
         auto it = sum_rows_pipelines.find(1);

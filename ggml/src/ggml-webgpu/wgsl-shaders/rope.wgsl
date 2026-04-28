@@ -1,4 +1,6 @@
+#ifdef HAS_F16
 enable f16;
+#endif
 
 #ifdef TYPE_F32
 #define DataType f32

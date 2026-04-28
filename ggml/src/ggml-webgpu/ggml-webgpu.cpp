@@ -184,6 +184,10 @@ struct webgpu_capabilities {
     wgpu::Limits limits;
     bool         supports_subgroups       = false;
     bool         supports_subgroup_matrix = false;
+    // True iff the adapter advertises wgpu::FeatureName::ShaderF16. When false,
+    // shaders are compiled without `enable f16;` (the HAS_F16 macro is undefined)
+    // and storage f16 values are decoded via unpack2x16float into f32 compute paths.
+    bool         has_f16                  = false;
 
     uint32_t sg_mat_m = 0;
     uint32_t sg_mat_n = 0;
@@ -3507,7 +3511,13 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
                 ctx->webgpu_global_ctx->adapter = std::move(adapter);
             }),
         UINT64_MAX);
-    GGML_ASSERT(ctx->webgpu_global_ctx->adapter != nullptr);
+    if (ctx->webgpu_global_ctx->adapter == nullptr) {
+        // No WebGPU adapter available (e.g. WebGPU disabled in browser, or
+        // requestAdapter returned null on a node without GPU). Fail soft so the
+        // backend registration just reports zero devices instead of aborting.
+        GGML_LOG_WARN("ggml_webgpu: No WebGPU adapter found; backend disabled\n");
+        return false;
+    }
 
     ctx->webgpu_global_ctx->adapter.GetLimits(&ctx->webgpu_global_ctx->capabilities.limits);
 
@@ -3523,8 +3533,15 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     ctx->webgpu_global_ctx->max_inflight_batches      = ggml_backend_webgpu_get_max_inflight_batches();
     wgpu::SupportedFeatures features;
     ctx->webgpu_global_ctx->adapter.GetFeatures(&features);
-    // we require f16 support
-    GGML_ASSERT(ctx->webgpu_global_ctx->adapter.HasFeature(wgpu::FeatureName::ShaderF16));
+    // f16 is preferred but no longer required. Record capability so the shader
+    // library can compile shaders without `enable f16;` and route through
+    // unpack2x16float / pack2x16float when this adapter does not advertise it
+    // (e.g. SwiftShader, older Intel iGPUs, some mobile GPUs).
+    ctx->webgpu_global_ctx->capabilities.has_f16 =
+        ctx->webgpu_global_ctx->adapter.HasFeature(wgpu::FeatureName::ShaderF16);
+    if (!ctx->webgpu_global_ctx->capabilities.has_f16) {
+        GGML_LOG_WARN("ggml_webgpu: shader-f16 not available; using f32 compute path\n");
+    }
     ctx->webgpu_global_ctx->capabilities.supports_subgroups =
         ctx->webgpu_global_ctx->adapter.HasFeature(wgpu::FeatureName::Subgroups);
 
@@ -3554,7 +3571,10 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     // Unfortunately, that is not possible, so we use the maximum subgroup size reported by the adapter.
     ctx->webgpu_global_ctx->capabilities.max_subgroup_size = info.subgroupMaxSize;
     // Initialize device
-    std::vector<wgpu::FeatureName> required_features       = { wgpu::FeatureName::ShaderF16 };
+    std::vector<wgpu::FeatureName> required_features;
+    if (ctx->webgpu_global_ctx->capabilities.has_f16) {
+        required_features.push_back(wgpu::FeatureName::ShaderF16);
+    }
 
 #ifndef __EMSCRIPTEN__
     required_features.push_back(wgpu::FeatureName::ImplicitDeviceSynchronization);
@@ -3639,7 +3659,8 @@ static webgpu_context initialize_webgpu_context(ggml_backend_dev_t dev) {
     ggml_backend_webgpu_device_context * dev_ctx    = (ggml_backend_webgpu_device_context *) dev->context;
     webgpu_context                       webgpu_ctx = std::make_shared<webgpu_context_struct>();
     webgpu_ctx->global_ctx                          = dev_ctx->webgpu_global_ctx;
-    webgpu_ctx->shader_lib = std::make_unique<ggml_webgpu_shader_lib>(dev_ctx->webgpu_global_ctx->device);
+    webgpu_ctx->shader_lib = std::make_unique<ggml_webgpu_shader_lib>(
+        dev_ctx->webgpu_global_ctx->device, dev_ctx->webgpu_global_ctx->capabilities.has_f16);
     webgpu_ctx->param_arena.init(
         webgpu_ctx->global_ctx->device, WEBGPU_PARAMS_BUF_SIZE_BYTES,
         webgpu_ctx->global_ctx->command_submit_batch_size + WEBGPU_NUM_PARAM_SLOT_SAFETY_MARGIN,
@@ -4145,7 +4166,13 @@ static ggml_backend_dev_t ggml_backend_webgpu_reg_get_device(ggml_backend_reg_t 
 
     ggml_backend_webgpu_reg_context * reg_ctx = static_cast<ggml_backend_webgpu_reg_context *>(reg->context);
 
-    create_webgpu_device(reg_ctx);
+    // Propagate adapter-failure as a null device. With the old GGML_ASSERT in
+    // create_webgpu_device, this path crashed; now we just report no device so
+    // the framework can fall through to the next backend (CPU).
+    if (!create_webgpu_device(reg_ctx)) {
+        WEBGPU_CPU_PROFILE_TOTAL_END(reg_get_device, reg_ctx->webgpu_global_ctx);
+        return nullptr;
+    }
 
     static ggml_backend_webgpu_device_context device_ctx;
     device_ctx.device_name            = GGML_WEBGPU_NAME;

@@ -1,5 +1,7 @@
 #include "common_decls.tmpl"
+#ifdef HAS_F16
 enable f16;
+#endif
 
 @group(0) @binding(0)
 #if defined(WEIGHT_F32)

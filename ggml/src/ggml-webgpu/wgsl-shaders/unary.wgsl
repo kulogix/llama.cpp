@@ -1,5 +1,7 @@
 #ifdef TYPE_F16
+#ifdef HAS_F16
 enable f16;
+#endif
 #define TYPE f16
 #else
 #define TYPE f32

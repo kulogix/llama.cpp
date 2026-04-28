@@ -1,5 +1,7 @@
 diagnostic(off, subgroup_uniformity);
+#ifdef HAS_F16
 enable f16;
+#endif
 enable subgroups;
 
 #ifdef KV_F32

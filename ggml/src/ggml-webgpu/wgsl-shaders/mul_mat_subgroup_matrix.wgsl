@@ -1,5 +1,7 @@
 diagnostic(off, chromium.subgroup_matrix_uniformity);
+#ifdef HAS_F16
 enable f16;
+#endif
 enable subgroups;
 enable chromium_experimental_subgroup_matrix;
 
