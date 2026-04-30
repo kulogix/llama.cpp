@@ -1137,75 +1137,27 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     int32_t aux32[8] __attribute__((aligned(16))) = {0};
     float sums[8] __attribute__((aligned(16))) = {0};
 
-    // Pre-load constant SIMD vectors once outside the per-block loop.
-    // wasm SIMD lacks immediate-broadcast operands so splats are explicit.
-    const v128_t mask_lownib = wasm_i8x16_splat(0x0F); // mask for low 4 bits of q4
-    const v128_t mask_2bit   = wasm_i8x16_splat(0x03); // mask for 2 bits of qh after shift
-    const v128_t bias_32     = wasm_i8x16_splat(32);   // -32 zero-point bias from Q6_K spec
-
+    // [wllama-fork] The earlier wllama-fork commit 24faf2918 attempted to
+    // vectorize this 6-bit unpack loop using wasm_v128_load + bit-shift
+    // intrinsics. After landing the WebGPU breakthrough we discovered the
+    // vectorized path causes the wasm64-CPU bench to hang (model loads,
+    // tokenization completes, but decode never produces output). The
+    // WebGPU build was unaffected since it doesn't use this CPU path.
+    // Reverting to the upstream scalar form. Future re-attempts should
+    // ship behind a unit test (test-quantize-fns runs on native arch only,
+    // not wasm — would need an emcc'd version of the test gated by
+    // GGML_USE_WASM_SIMD or similar).
     for (int i = 0; i < nb; ++i) {
-        // Unpack 6-bit quantized data into aux8 — vectorized.
-        //
-        // Q6_K block layout (per QK_K=256 sub-block of 128 elements):
-        //   q4[0..63]  — 64 bytes, each holding two 4-bit nibbles
-        //                  low-nibble of q4[l]      → output position l +  0
-        //                  high-nibble of q4[l]     → output position l + 64
-        //                  low-nibble of q4[l+32]   → output position l + 32
-        //                  high-nibble of q4[l+32]  → output position l + 96
-        //   qh[0..31]  — 32 bytes carrying the 2 high-bits per element,
-        //                  packed 4 per byte:
-        //                  bits 0-1 of qh[l]        → high bits of pos l +  0
-        //                  bits 2-3 of qh[l]        → high bits of pos l + 32
-        //                  bits 4-5 of qh[l]        → high bits of pos l + 64
-        //                  bits 6-7 of qh[l]        → high bits of pos l + 96
-        //
-        // We process 16 elements per region per inner SIMD step using v128_t
-        // ops on bytes; two steps cover all 32 elements per outer-j iter.
-        // Each output byte = ((q4_nibble) | (qh_2bits << 4)) - 32, fitting in
-        // int8_t (range [-32, +31]).
+        // Unpack 6-bit quantized data into aux8 (unchanged)
         const uint8_t * GGML_RESTRICT q4 = x[i].ql;
         const uint8_t * GGML_RESTRICT qh = x[i].qh;
         int8_t * a = aux8;
         for (int j = 0; j < QK_K; j += 128) {
-            for (int chunk = 0; chunk < 32; chunk += 16) {
-                const v128_t q4_lo = wasm_v128_load(q4 +  0 + chunk); // q4[l+ 0..]
-                const v128_t q4_hi = wasm_v128_load(q4 + 32 + chunk); // q4[l+32..]
-                const v128_t qhv   = wasm_v128_load(qh +  0 + chunk); // qh[l+  0..]
-
-                // Region 0: low nibble of q4_lo, high bits from qh & 0x03
-                {
-                    const v128_t lo = wasm_v128_and(q4_lo, mask_lownib);
-                    const v128_t hi = wasm_i8x16_shl(wasm_v128_and(qhv, mask_2bit), 4);
-                    const v128_t v  = wasm_i8x16_sub(wasm_v128_or(lo, hi), bias_32);
-                    wasm_v128_store(a + 0 + chunk, v);
-                }
-                // Region 32: low nibble of q4_hi, high bits from (qh>>2)&0x03
-                {
-                    const v128_t qh2 = wasm_u8x16_shr(qhv, 2);
-                    const v128_t lo  = wasm_v128_and(q4_hi, mask_lownib);
-                    const v128_t hi  = wasm_i8x16_shl(wasm_v128_and(qh2, mask_2bit), 4);
-                    const v128_t v   = wasm_i8x16_sub(wasm_v128_or(lo, hi), bias_32);
-                    wasm_v128_store(a + 32 + chunk, v);
-                }
-                // Region 64: high nibble of q4_lo, high bits from (qh>>4)&0x03
-                {
-                    const v128_t qh4 = wasm_u8x16_shr(qhv, 4);
-                    const v128_t lo  = wasm_u8x16_shr(q4_lo, 4);
-                    const v128_t hi  = wasm_i8x16_shl(wasm_v128_and(qh4, mask_2bit), 4);
-                    const v128_t v   = wasm_i8x16_sub(wasm_v128_or(lo, hi), bias_32);
-                    wasm_v128_store(a + 64 + chunk, v);
-                }
-                // Region 96: high nibble of q4_hi, high bits from (qh>>6)&0x03
-                {
-                    const v128_t qh6 = wasm_u8x16_shr(qhv, 6);
-                    const v128_t lo  = wasm_u8x16_shr(q4_hi, 4);
-                    // (qh>>6) & 0x03 == qh>>6 since shift cleared upper bits;
-                    // mask is redundant but kept for clarity / future-proofing
-                    // if a wider qh source is ever used.
-                    const v128_t hi  = wasm_i8x16_shl(wasm_v128_and(qh6, mask_2bit), 4);
-                    const v128_t v   = wasm_i8x16_sub(wasm_v128_or(lo, hi), bias_32);
-                    wasm_v128_store(a + 96 + chunk, v);
-                }
+            for (int l = 0; l < 32; ++l) {
+                a[l +  0] = (int8_t)((q4[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                a[l + 32] = (int8_t)((q4[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                a[l + 64] = (int8_t)((q4[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                a[l + 96] = (int8_t)((q4[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
             }
             a += 128;
             q4 += 64;
