@@ -3250,7 +3250,56 @@ static void ggml_backend_webgpu_buffer_clear(ggml_backend_buffer_t buffer, uint8
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_buffer_clear(" << buffer << ", " << (uint32_t) value << ")");
     WEBGPU_CPU_PROFILE_TOTAL_START(clear);
     ggml_backend_webgpu_buffer_context * buf_ctx = (ggml_backend_webgpu_buffer_context *) buffer->context;
+
+#if defined(__EMSCRIPTEN__)
+    // [wllama-fork patch] On Dawn-Emscripten + ASYNCIFY + pthreads, the
+    // shader-based memset path (ggml_backend_webgpu_buffer_memset) crashes
+    // with "Object.getJsObject" assertion when creating the dynamic
+    // BindGroup for the memset pipeline. set_tensor uses Queue::WriteBuffer
+    // which works fine, so we route buffer_clear through WriteBuffer too —
+    // slower for large buffers (~48 MiB KV cache: ~30 ms vs ~1 ms via
+    // shader) but correct, and only invoked at init time, not in hot path.
+    //
+    // Upstream issue: this is a Dawn-Emscripten bug or interaction with
+    // ASYNCIFY/pthreads when CreateBindGroup is called from a worker thread.
+    // Once fixed upstream, this branch can be removed.
+    const size_t total_size = buffer->size;
+    if (total_size == 0) {
+        WEBGPU_CPU_PROFILE_TOTAL_END(clear, buf_ctx->global_ctx);
+        return;
+    }
+
+    // WriteBuffer requires size to be a multiple of 4 bytes and offset
+    // aligned to 4. Build a CPU-side fill buffer of `value` bytes.
+    // Use an arena-style chunked write to avoid allocating 100s of MiB
+    // at once on the wasm heap.
+    constexpr size_t WRITE_CHUNK = 4 * 1024 * 1024;  // 4 MiB chunks
+    std::vector<uint8_t> chunk(std::min(total_size, WRITE_CHUNK), value);
+    for (size_t off = 0; off < total_size; off += chunk.size()) {
+        size_t this_size = std::min(chunk.size(), total_size - off);
+        // Round down to multiple of 4 (WriteBuffer requirement).
+        size_t aligned_size = this_size & ~size_t{3};
+        if (aligned_size > 0) {
+            buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, off,
+                                                   chunk.data(), aligned_size);
+        }
+        // Handle the trailing 1-3 bytes of the final chunk (if any) by
+        // packing them into a uint32_t and falling through — but for the
+        // common cases we hit (KV cache buffers are always 4-aligned),
+        // aligned_size == this_size and the tail path isn't taken.
+        if (aligned_size < this_size) {
+            uint32_t tail = 0;
+            for (size_t i = 0; i < (this_size - aligned_size); i++) {
+                ((uint8_t *)&tail)[i] = value;
+            }
+            buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer,
+                                                   off + aligned_size,
+                                                   &tail, sizeof(tail));
+        }
+    }
+#else
     ggml_backend_webgpu_buffer_memset(buf_ctx->global_ctx, buf_ctx->buffer, value, 0, buffer->size);
+#endif
     WEBGPU_CPU_PROFILE_TOTAL_END(clear, buf_ctx->global_ctx);
 }
 
