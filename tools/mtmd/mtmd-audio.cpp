@@ -14,6 +14,19 @@
 
 constexpr bool DEBUG = false;
 
+// [wllama-fork] On Emscripten builds without -pthread (specifically our
+// no-pthread WebGPU variant — see comment in scripts/build-wasm.sh), the
+// std::thread constructor throws "Not supported" because there's no
+// pthread runtime. Clamp the audio-preprocessing thread count to 1 in
+// that case so the hardcoded n_threads=4 in log_mel_spectrogram() call
+// sites doesn't crash. Detection: __EMSCRIPTEN_PTHREADS__ is defined by
+// emcc only when -pthread is on; absence means single-thread wasm.
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#define MTMD_AUDIO_PREPROCESS_THREADS 1
+#else
+#define MTMD_AUDIO_PREPROCESS_THREADS 4
+#endif
+
 void mtmd_audio_cache::fill_sin_cos_table(uint32_t n) {
     sin_vals.resize(n);
     cos_vals.resize(n);
@@ -568,7 +581,7 @@ bool mtmd_audio_preprocessor_whisper::preprocess(const float *                 s
 
     mtmd_audio_mel out_full;
     bool           ok = log_mel_spectrogram(samples, n_samples,
-                                            4,  // n_threads
+                                            MTMD_AUDIO_PREPROCESS_THREADS,  // n_threads
                                             params, cache, out_full);
     if (!ok) {
         return false;
@@ -640,7 +653,7 @@ bool mtmd_audio_preprocessor_conformer::preprocess(const float *                
 
     mtmd_audio_mel out_full;
     bool           ok = log_mel_spectrogram(samples, n_samples,
-                                            4,  // n_threads
+                                            MTMD_AUDIO_PREPROCESS_THREADS,  // n_threads
                                             params, cache, out_full);
     if (!ok) {
         return false;
@@ -717,7 +730,7 @@ bool mtmd_audio_preprocessor_gemma4a::preprocess(const float *                 s
         std::copy(chunk_ptr, chunk_ptr + chunk_len, padded_samples.data() + pad_left);
 
         mtmd_audio_mel out_chunk;
-        bool ok = log_mel_spectrogram(padded_samples.data(), padded_samples.size(), 4, params, cache, out_chunk);
+        bool ok = log_mel_spectrogram(padded_samples.data(), padded_samples.size(), MTMD_AUDIO_PREPROCESS_THREADS, params, cache, out_chunk);
         if (!ok) {
             return false;
         }
