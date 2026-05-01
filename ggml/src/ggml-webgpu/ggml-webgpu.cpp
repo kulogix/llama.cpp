@@ -3929,6 +3929,27 @@ static bool create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
         }
     }
 #endif
+    // [wllama-fork 2026-05-01] Phase 3 Pivot: Emscripten builds can't query
+    // the SubgroupMatrixConfig from C++ (emdawnwebgpu doesn't expose
+    // wgpu::AdapterPropertiesSubgroupMatrixConfigs / SubgroupMatrixConfig /
+    // ChromiumExperimentalSubgroupMatrix feature enum). BUT the WGSL
+    // `enable chromium_experimental_subgroup_matrix;` directive DOES work in
+    // emdawnwebgpu — flash_attn.wgsl has been using it for months. So the
+    // device does support subgroup matrix; we just can't auto-detect from
+    // C++. Force-enable via -DWLLAMA_FORCE_SUBGROUP_MATRIX with hardcoded
+    // M=N=K=8 (Apple Silicon's typical config). On a device where this
+    // doesn't work, the user will see runtime WGSL compile failures and
+    // can rebuild without the flag.
+#if defined(__EMSCRIPTEN__) && defined(WLLAMA_FORCE_SUBGROUP_MATRIX)
+    if (ctx->webgpu_global_ctx->capabilities.supports_subgroups) {
+        ctx->webgpu_global_ctx->capabilities.sg_mat_m = 8;
+        ctx->webgpu_global_ctx->capabilities.sg_mat_n = 8;
+        ctx->webgpu_global_ctx->capabilities.sg_mat_k = 8;
+        valid_subgroup_matrix_config = true;
+        GGML_LOG_INFO("ggml_webgpu: subgroup-matrix matmul FORCE-ENABLED for Emscripten "
+                      "(hardcoded M=N=K=8; chromium_experimental_subgroup_matrix WGSL feature assumed available)\n");
+    }
+#endif
     ctx->webgpu_global_ctx->capabilities.supports_subgroup_matrix = valid_subgroup_matrix_config;
 
     // For subgroup matrix code to be the most efficient, we would like the subgroup size to be consistent and accurate.
