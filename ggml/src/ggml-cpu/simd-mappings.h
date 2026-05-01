@@ -846,6 +846,19 @@ inline static void __wasm_f16x4_store(ggml_fp16_t * p, v128_t x) {
     p[3] = GGML_CPU_FP32_TO_FP16(tmp[3]);
 }
 
+// [wllama-fork 2026-05-01] Tried to vectorize __wasm_f16x4_load using
+// hand-rolled SIMD bit-twiddling for IEEE 754 half->single conversion.
+// Bench result: text decode +2.5%, image decode +9% — but image TTFT
+// REGRESSED -21% (37.7s -> 45.5s) and audio TTFT -7.6%. V8 apparently
+// doesn't JIT the 6-op SIMD bitwise sequence as efficiently as the
+// memory-bound table-lookup pattern, and the regression on
+// SigLIP-vision-encoder forward pass dominated the wins. Reverted.
+// Possible future angles:
+//   - Profile to find where in the SigLIP pass the regression hit
+//   - Try wider load: 8-element f16 -> 8 f32 in a single SIMD chunk
+//   - Wait for wasm fp16 SIMD proposal (f16x8 instructions land in V8)
+//   - Different conversion algo (e.g. bias-shift trick per Maratyszcza)
+
 #define GGML_F16x4             v128_t
 #define GGML_F16x4_ZERO        wasm_f32x4_splat(0.0f)
 #define GGML_F16x4_SET1(x)     wasm_f32x4_splat(x)
