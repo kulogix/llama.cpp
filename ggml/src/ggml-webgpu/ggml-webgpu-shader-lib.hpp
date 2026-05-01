@@ -1020,6 +1020,12 @@ class ggml_webgpu_shader_lib {
                        ggml_webgpu_rms_norm_mul_pipeline_key_hash>
         rms_norm_mul_pipelines;
 
+    // [wllama-fork 2026-05-01] Phase 3 Fusion #1: RMS_NORM + MUL + ADD.
+    // Two variants: NORMAL (4 distinct buffers) and INPLACE_RN_DST (dst
+    // aliases rn_src — the common gemma-3n case).
+    webgpu_pipeline rms_norm_mul_add_pipeline_normal;
+    webgpu_pipeline rms_norm_mul_add_pipeline_inplace_rn;
+
   public:
     ggml_webgpu_shader_lib(wgpu::Device device, bool has_f16)
         : device(device), preprocessor(ggml_webgpu_make_preproc_opts(has_f16)), has_f16_(has_f16) {}
@@ -2155,6 +2161,40 @@ class ggml_webgpu_shader_lib {
         pipeline.context            = decisions;
         rms_norm_mul_pipelines[key] = pipeline;
         return rms_norm_mul_pipelines[key];
+    }
+
+    // [wllama-fork 2026-05-01] Phase 3 Fusion #1: RMS_NORM + MUL + ADD.
+    // Triple fusion of the gemma-3n / Llama "post-block residual" pattern:
+    //   tmp = norm(x) * w + residual
+    // ~72 fires per decode token in gemma-3n E2B (post-attn O-proj+norm+
+    // residual; post-FFN down-proj+norm+residual; both per-layer).
+    //
+    // The `context.inplace` flag selects the INPLACE_RN_DST variant which
+    // collapses rn_src and dst onto a single read_write binding (needed
+    // when ggml's allocator reuses rn_src's buffer for dst, which is the
+    // common case since rn_src is dead after the chain).
+    webgpu_pipeline get_rms_norm_mul_add_pipeline(const ggml_webgpu_shader_lib_context & context) {
+        webgpu_pipeline & slot =
+            context.inplace ? rms_norm_mul_add_pipeline_inplace_rn : rms_norm_mul_add_pipeline_normal;
+        if (slot.pipeline) {
+            return slot;
+        }
+
+        std::vector<std::string> defines;
+        std::string              variant = "RMS_NORM_MUL_ADD";
+        if (context.inplace) {
+            defines.push_back("INPLACE_RN_DST");
+            variant += "_inplace_rn";
+        }
+        defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
+
+        auto            processed   = preprocessor.preprocess(wgsl_rms_norm_mul_add, defines);
+        auto            decisions   = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        decisions->wg_size          = context.max_wg_size;
+        webgpu_pipeline pipeline    = ggml_webgpu_create_pipeline(device, processed, variant);
+        pipeline.context            = decisions;
+        slot                        = pipeline;
+        return slot;
     }
 
     webgpu_pipeline get_binary_pipeline(const ggml_webgpu_shader_lib_context & context) {

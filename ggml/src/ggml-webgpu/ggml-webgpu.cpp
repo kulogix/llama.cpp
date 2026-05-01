@@ -2291,6 +2291,79 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul(webgpu_context 
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, ggml_nrows(dst));
 }
 
+// [wllama-fork 2026-05-01] Phase 3 Fusion #1: RMS_NORM + MUL + ADD dispatcher.
+// dst = (1/sqrt(mean(rn_src^2)+eps)) * rn_src * w + residual
+//
+// Picks INPLACE_RN_DST variant when ggml's allocator put dst in rn_src's
+// buffer (the common gemma-3n case); falls back to caller (encode switch)
+// when other aliasing patterns are detected (residual-aliases-dst etc.)
+// since v1 only supports the rn_src-aliases-dst case.
+static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul_add(webgpu_context & ctx,
+                                                                     ggml_tensor *    rn_src,
+                                                                     ggml_tensor *    rms_norm,
+                                                                     ggml_tensor *    mul_weight,
+                                                                     ggml_tensor *    residual,
+                                                                     ggml_tensor *    dst) {
+    // Predicate already vetted aliasing — if we're here, either NORMAL (4
+    // distinct buffers) or INPLACE_RN_DST (dst exactly equals rn_src).
+    const bool inplace_rn_dst = ggml_webgpu_tensor_equal(rn_src, dst);
+
+    // Param block must match Params struct in rms_norm_mul_add.wgsl.
+    std::vector<uint32_t> params = {
+        // offsets in elements (f32)
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, rn_src) / ggml_type_size(rn_src->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, mul_weight) / ggml_type_size(mul_weight->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, residual) / ggml_type_size(residual->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+        // strides in elements
+        (uint32_t) (rn_src->nb[1] / ggml_type_size(rn_src->type)),
+        (uint32_t) (rn_src->nb[2] / ggml_type_size(rn_src->type)),
+        (uint32_t) (rn_src->nb[3] / ggml_type_size(rn_src->type)),
+        (uint32_t) (mul_weight->nb[1] / ggml_type_size(mul_weight->type)),
+        (uint32_t) (mul_weight->nb[2] / ggml_type_size(mul_weight->type)),
+        (uint32_t) (mul_weight->nb[3] / ggml_type_size(mul_weight->type)),
+        (uint32_t) (residual->nb[1] / ggml_type_size(residual->type)),
+        (uint32_t) (residual->nb[2] / ggml_type_size(residual->type)),
+        (uint32_t) (residual->nb[3] / ggml_type_size(residual->type)),
+        (uint32_t) (dst->nb[1] / ggml_type_size(dst->type)),
+        (uint32_t) (dst->nb[2] / ggml_type_size(dst->type)),
+        (uint32_t) (dst->nb[3] / ggml_type_size(dst->type)),
+        // dst shape (same as rn_src and residual)
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], (uint32_t) dst->ne[3],
+        // weight shape (for broadcast)
+        (uint32_t) mul_weight->ne[0], (uint32_t) mul_weight->ne[1],
+        (uint32_t) mul_weight->ne[2], (uint32_t) mul_weight->ne[3],
+        // epsilon
+        ggml_webgpu_u32_from_f32(ggml_get_op_params_f32(rms_norm, 0)),
+    };
+
+    std::vector<wgpu::BindGroupEntry> entries;
+    if (inplace_rn_dst) {
+        // INPLACE_RN_DST variant: 3 bindings (rn_src and dst share binding 0).
+        entries = {
+            ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, rn_src),
+            ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, mul_weight),
+            ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, residual),
+        };
+    } else {
+        // NORMAL variant: 4 bindings.
+        entries = {
+            ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, rn_src),
+            ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, mul_weight),
+            ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, residual),
+            ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, dst),
+        };
+    }
+
+    ggml_webgpu_shader_lib_context shader_lib_ctx = {};
+    shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+    shader_lib_ctx.inplace     = inplace_rn_dst;
+
+    webgpu_pipeline pipeline = ctx->shader_lib->get_rms_norm_mul_add_pipeline(shader_lib_ctx);
+
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, ggml_nrows(dst));
+}
+
 static webgpu_encoded_op ggml_webgpu_row_norm(webgpu_context & ctx, ggml_tensor * src, ggml_tensor * dst) {
     bool inplace = ggml_webgpu_tensor_equal(src, dst);
 
@@ -2814,6 +2887,87 @@ static bool ggml_webgpu_can_fuse_rms_norm_mul(const struct ggml_cgraph * cgraph,
     return true;
 }
 
+// [wllama-fork 2026-05-01] Phase 3 Fusion #1: RMS_NORM + MUL + ADD.
+// Pattern: dst = norm(rn_src) * w + residual
+// Common gemma-3n / Llama "post-block residual" sequence (post-attn
+// O-proj + norm + residual; post-FFN down-proj + norm + residual).
+// MUL output is single-use (only the residual ADD reads it), so
+// ggml_can_fuse accepts the chain. ADD's output has multiple uses but
+// is the LAST op of the fusion so that's allowed.
+// ~72 fires per decode token in gemma-3n E2B.
+static bool ggml_webgpu_can_fuse_rms_norm_mul_add(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+        return false;
+    }
+    const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+    const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add      = cgraph->nodes[node_idx + 2];
+
+    // All-f32 only.
+    if (rms_norm->type != GGML_TYPE_F32 || rms_norm->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (mul->type != GGML_TYPE_F32 || mul->src[0] == nullptr || mul->src[1] == nullptr ||
+        mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (add->type != GGML_TYPE_F32 || add->src[0] == nullptr || add->src[1] == nullptr ||
+        add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // MUL must consume RMS_NORM output. Identify the weight (the other operand).
+    const ggml_tensor * mul_weight = nullptr;
+    if (mul->src[0] == rms_norm) {
+        mul_weight = mul->src[1];
+    } else if (mul->src[1] == rms_norm) {
+        mul_weight = mul->src[0];
+    } else {
+        return false;
+    }
+    // ADD must consume MUL output. Identify the residual (the other operand).
+    const ggml_tensor * residual = nullptr;
+    if (add->src[0] == mul) {
+        residual = add->src[1];
+    } else if (add->src[1] == mul) {
+        residual = add->src[0];
+    } else {
+        return false;
+    }
+    // residual must be same shape as MUL output (no broadcast in v1).
+    if (!ggml_are_same_shape(residual, mul)) {
+        return false;
+    }
+    // Contiguity required by the shader.
+    if (!ggml_is_contiguous_rows(rms_norm->src[0]) || !ggml_is_contiguous_rows(mul_weight) ||
+        !ggml_is_contiguous_rows(residual)) {
+        return false;
+    }
+    // [wllama-fork 2026-05-01] Aliasing handling: WebGPU forbids the same
+    // buffer being bound as both read AND read_write in one sync scope, even
+    // with different access modes declared in the shader. We support exactly
+    // two cases via shader variants:
+    //   NORMAL: 4 distinct buffers
+    //   INPLACE_RN_DST: dst exactly equals rn_src
+    // Any other overlap pattern → reject the fusion (let the existing 2-op
+    // rms_norm_mul fusion handle it instead).
+    ggml_tensor * rn_src_t   = rms_norm->src[0];
+    ggml_tensor * mul_w_t    = const_cast<ggml_tensor *>(mul_weight);
+    ggml_tensor * residual_t = const_cast<ggml_tensor *>(residual);
+    ggml_tensor * dst_t      = const_cast<ggml_tensor *>(add);
+    const bool inplace_rn_dst = ggml_webgpu_tensor_equal(rn_src_t, dst_t);
+    if (!inplace_rn_dst && ggml_webgpu_tensor_overlap(rn_src_t, dst_t)) {
+        return false; // partial rn_src↔dst overlap unsupported in v1
+    }
+    if (ggml_webgpu_tensor_overlap(mul_w_t, dst_t) ||
+        ggml_webgpu_tensor_overlap(residual_t, dst_t) ||
+        ggml_webgpu_tensor_overlap(rn_src_t, mul_w_t) ||
+        ggml_webgpu_tensor_overlap(rn_src_t, residual_t) ||
+        ggml_webgpu_tensor_overlap(mul_w_t, residual_t)) {
+        return false; // unsupported aliasing pattern
+    }
+    return true;
+}
+
 // Returns the encoded command, or std::nullopt if the operation is a no-op
 static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
                                                            ggml_cgraph *  cgraph,
@@ -2858,6 +3012,15 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_webgpu_flash_attn(ctx, src0, src1, src2, node->src[3], node->src[4], node);
         case GGML_OP_ADD:
+            // [wllama-fork 2026-05-01] Phase 3 Fusion #1: ADD+RMS_NORM+MUL fusion
+            // attempted at the ADD case — DISABLED. Pattern direction was wrong:
+            // ADD's output has multiple uses in the residual stream (next norm
+            // AND next layer's residual ADD), so ggml_can_fuse rejects the
+            // intermediate-single-use requirement. The right fusion direction
+            // is RMS_NORM + MUL + ADD (triggered at the RMS_NORM case), where
+            // the MUL output is single-use (only the residual ADD reads it).
+            // See trace at /tmp/bench-fusion1-dbg.log for evidence.
+            return ggml_webgpu_binary_op(ctx, src0, src1, node);
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
@@ -2867,13 +3030,26 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
         case GGML_OP_REPEAT:
             return ggml_webgpu_repeat(ctx, src0, node);
         case GGML_OP_RMS_NORM:
+            // [wllama-fork 2026-05-01] Phase 3 Fusion #1: try triple
+            // RMS_NORM + MUL + ADD first (more fused). Falls back to the
+            // existing 2-op rms_norm+mul, then to standalone row_norm.
+            // Stack-overflow earlier was a 64KB-stack issue inside Dawn's
+            // CreateShaderModule on the lazy path; build now uses
+            // -sSTACK_SIZE=1048576 (see scripts/build-wasm.sh).
+            if (ggml_webgpu_can_fuse_rms_norm_mul_add(cgraph, node_idx)) {
+                num_encoded_ops          = 3;
+                ggml_tensor * mul_node   = nodes[node_idx + 1];
+                ggml_tensor * add_node   = nodes[node_idx + 2];
+                ggml_tensor * mul_weight = (mul_node->src[0] == node) ? mul_node->src[1] : mul_node->src[0];
+                ggml_tensor * residual   = (add_node->src[0] == mul_node) ? add_node->src[1] : add_node->src[0];
+                return ggml_webgpu_rms_norm_mul_add(ctx, src0, node, mul_weight, residual, add_node);
+            }
             if (ggml_webgpu_can_fuse_rms_norm_mul(cgraph, node_idx)) {
                 num_encoded_ops        = 2;
                 ggml_tensor * mul_node = nodes[node_idx + 1];
                 return ggml_webgpu_rms_norm_mul(ctx, src0, node, mul_node->src[0], mul_node->src[1], mul_node);
-            } else {
-                return ggml_webgpu_row_norm(ctx, src0, node);
             }
+            return ggml_webgpu_row_norm(ctx, src0, node);
         case GGML_OP_L2_NORM:
             return ggml_webgpu_row_norm(ctx, src0, node);
         case GGML_OP_ROPE:
@@ -3000,13 +3176,31 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     int      node_idx             = 0;
 
 #ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
-    // [wllama-fork 2026-05-01] Phase 2: count submit batches + total ops per
-    // graph_compute call. Hypothesis (per research/wasm-mt research): the
-    // per-submit JS<->Dawn round-trip is the dominant browser-perf cost.
-    // Each token = 1 graph_compute => this prints exactly one summary line
-    // per token, suitable for puppeteer log capture without flooding.
-    uint32_t trace_total_submits = 0;
-    uint32_t trace_total_ops     = 0;
+    // [wllama-fork 2026-05-01] Phase 2 + Phase 3 prep: count submit batches +
+    // total ops per graph_compute call, plus wallclock timing of the whole
+    // graph_compute and the per-batch submit cost. Phase 3 needs to know the
+    // breakdown of "submit overhead vs encode overhead vs everything else"
+    // before deciding what to optimize next. Each token = 1 graph_compute,
+    // so this prints exactly one summary line per token.
+    uint32_t trace_total_submits  = 0;
+    uint32_t trace_total_ops      = 0;
+    double   trace_submit_ms      = 0.0;
+    double   trace_encode_ms      = 0.0;
+    auto     trace_graph_start    = std::chrono::high_resolution_clock::now();
+    auto     trace_encode_start   = trace_graph_start;
+
+    // [wllama-fork 2026-05-01] Phase 3 fusion-pattern hunt: on the first 3
+    // graph_compute calls, dump the full op sequence so we can identify
+    // hot fusable patterns in gemma-4. Each line shows the op name + a
+    // shape/type hint. Self-disabling after 3 dumps.
+    static int trace_seq_dumps_remaining = 3;
+    bool       trace_dump_seq            = (trace_seq_dumps_remaining > 0);
+    if (trace_dump_seq) {
+        trace_seq_dumps_remaining--;
+        fprintf(stderr,
+                "@@INFO@@ [webgpu-trace-seq] BEGIN graph_compute n_nodes=%d\n",
+                cgraph->n_nodes);
+    }
 #endif
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
@@ -3024,6 +3218,20 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
         if (cgraph->nodes[node_idx]->op == GGML_OP_SET_ROWS) {
             contains_set_rows = true;
         }
+#ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
+        if (trace_dump_seq) {
+            const ggml_tensor * n = cgraph->nodes[node_idx];
+            const char * src0_t = n->src[0] ? ggml_type_name(n->src[0]->type) : "-";
+            const char * src1_t = n->src[1] ? ggml_type_name(n->src[1]->type) : "-";
+            fprintf(stderr,
+                    "@@INFO@@ [webgpu-trace-seq] [%4d] %s dst=%s ne=[%lld,%lld,%lld,%lld] src0=%s src1=%s\n",
+                    node_idx,
+                    ggml_op_name(n->op),
+                    ggml_type_name(n->type),
+                    (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+                    src0_t, src1_t);
+        }
+#endif
         if (auto cmd = ggml_webgpu_encode(ctx, cgraph, node_idx, num_encoded_ops)) {
             commands.push_back(*cmd);
             num_batched_kernels += cmd.value().num_kernels;
@@ -3041,9 +3249,17 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                 ctx->active_compute_pass.End();
             }
             num_batched_kernels                = 0;
+#ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
+            auto trace_encode_end = std::chrono::high_resolution_clock::now();
+            trace_encode_ms += std::chrono::duration<double, std::milli>(trace_encode_end - trace_encode_start).count();
+            auto trace_submit_start = trace_encode_end;
+#endif
             wgpu::CommandBuffer batch_commands = ctx->active_command_encoder.Finish();
             ggml_backend_webgpu_submit_commands(ctx, batch_commands, num_inflight_batches);
 #ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
+            auto trace_submit_end = std::chrono::high_resolution_clock::now();
+            trace_submit_ms += std::chrono::duration<double, std::milli>(trace_submit_end - trace_submit_start).count();
+            trace_encode_start = trace_submit_end;
             trace_total_submits++;
 #endif
 
@@ -3066,9 +3282,16 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     }
 
     if (num_batched_kernels > 0) {
+#ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
+        auto trace_encode_end = std::chrono::high_resolution_clock::now();
+        trace_encode_ms += std::chrono::duration<double, std::milli>(trace_encode_end - trace_encode_start).count();
+        auto trace_submit_start = trace_encode_end;
+#endif
         wgpu::CommandBuffer batch_commands = ctx->active_command_encoder.Finish();
         ggml_backend_webgpu_submit_commands(ctx, batch_commands, num_inflight_batches);
 #ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
+        auto trace_submit_end = std::chrono::high_resolution_clock::now();
+        trace_submit_ms += std::chrono::duration<double, std::milli>(trace_submit_end - trace_submit_start).count();
         trace_total_submits++;
 #endif
         ctx->param_arena.reset();
@@ -3077,13 +3300,18 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     ctx->active_command_encoder = nullptr;
 
 #ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
+    auto   trace_graph_end  = std::chrono::high_resolution_clock::now();
+    double trace_graph_ms   = std::chrono::duration<double, std::milli>(trace_graph_end - trace_graph_start).count();
+    double trace_other_ms   = trace_graph_ms - trace_encode_ms - trace_submit_ms;
     fprintf(stderr,
-            "@@INFO@@ [webgpu-trace] graph_compute: nodes=%d ops=%u submits=%u batch_size=%u ops_per_submit_avg=%.1f\n",
+            "@@INFO@@ [webgpu-trace] graph_compute: nodes=%d ops=%u submits=%u total_ms=%.2f encode_ms=%.2f submit_ms=%.2f other_ms=%.2f\n",
             cgraph->n_nodes,
             trace_total_ops,
             trace_total_submits,
-            ctx->global_ctx->command_submit_batch_size,
-            trace_total_submits ? (double) trace_total_ops / trace_total_submits : 0.0);
+            trace_graph_ms,
+            trace_encode_ms,
+            trace_submit_ms,
+            trace_other_ms);
     fflush(stderr);
 #endif
 
