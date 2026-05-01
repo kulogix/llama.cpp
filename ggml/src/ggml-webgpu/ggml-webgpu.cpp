@@ -86,7 +86,26 @@ static inline uint32_t ggml_webgpu_u32_from_f32(float value) {
 
 /* Constants */
 
+// [wllama-fork 2026-05-01] Phase 2 experiment: this controls how many ops
+// get encoded into one wgpuQueueSubmit. We tested 32, 64, 256 against
+// gemma-4 E2B Q6_K + mmproj-F16 on M3 Max headless Chrome 147:
+//
+//   BATCH=32  -> 4985 submits, text decode 28.00 t/s
+//   BATCH=64  -> 2587 submits, text decode 28.45 t/s   <-- near-optimal
+//   BATCH=256 -> 849 submits,  text decode 18.86 t/s   <-- regresses 34%!
+//
+// Counterintuitive but consistent: larger batches HURT because they break
+// GPU pipeline depth. With BATCH=64 the CPU can encode batch N+1 while
+// the GPU executes batch N; with BATCH=256 the GPU finishes its batch
+// and starves while the CPU is still encoding the next one. Net effect:
+// submit-overhead is NOT the dominant browser-perf cost for our load.
+//
+// Keep upstream default (64). Override via -D at compile time only for
+// experiments. The build script honors WLLAMA_WEBGPU_SUBMIT_BATCH_OVERRIDE
+// env var.
+#ifndef WEBGPU_DEFAULT_COMMAND_SUBMIT_BATCH_SIZE
 #define WEBGPU_DEFAULT_COMMAND_SUBMIT_BATCH_SIZE 64u
+#endif
 #define WEBGPU_NUM_PARAM_SLOT_SAFETY_MARGIN      10u
 #define WEBGPU_RUNTIME_WAIT_TIMEOUT_MS           30000u
 #define WEBGPU_RUNTIME_WAIT_TIMEOUT_NS           (WEBGPU_RUNTIME_WAIT_TIMEOUT_MS * 1e6)
@@ -2980,6 +2999,16 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     int      num_encoded_ops      = 1;
     int      node_idx             = 0;
 
+#ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
+    // [wllama-fork 2026-05-01] Phase 2: count submit batches + total ops per
+    // graph_compute call. Hypothesis (per research/wasm-mt research): the
+    // per-submit JS<->Dawn round-trip is the dominant browser-perf cost.
+    // Each token = 1 graph_compute => this prints exactly one summary line
+    // per token, suitable for puppeteer log capture without flooding.
+    uint32_t trace_total_submits = 0;
+    uint32_t trace_total_ops     = 0;
+#endif
+
 #ifdef GGML_WEBGPU_GPU_PROFILE
     ctx->profile_timestamp_query_count = 0;
     batch_compute_passes               = false;
@@ -2998,6 +3027,9 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
         if (auto cmd = ggml_webgpu_encode(ctx, cgraph, node_idx, num_encoded_ops)) {
             commands.push_back(*cmd);
             num_batched_kernels += cmd.value().num_kernels;
+#ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
+            trace_total_ops += cmd.value().num_kernels;
+#endif
 #ifdef GGML_WEBGPU_GPU_PROFILE
             profile_pipeline_names.insert(profile_pipeline_names.end(), cmd->pipeline_names.begin(),
                                           cmd->pipeline_names.end());
@@ -3011,6 +3043,9 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
             num_batched_kernels                = 0;
             wgpu::CommandBuffer batch_commands = ctx->active_command_encoder.Finish();
             ggml_backend_webgpu_submit_commands(ctx, batch_commands, num_inflight_batches);
+#ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
+            trace_total_submits++;
+#endif
 
             // reset state for next batch
             ctx->active_command_encoder = ctx->global_ctx->device.CreateCommandEncoder();
@@ -3033,10 +3068,24 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     if (num_batched_kernels > 0) {
         wgpu::CommandBuffer batch_commands = ctx->active_command_encoder.Finish();
         ggml_backend_webgpu_submit_commands(ctx, batch_commands, num_inflight_batches);
+#ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
+        trace_total_submits++;
+#endif
         ctx->param_arena.reset();
         commands.clear();
     }
     ctx->active_command_encoder = nullptr;
+
+#ifdef WLLAMA_WEBGPU_SUBMIT_TRACE
+    fprintf(stderr,
+            "@@INFO@@ [webgpu-trace] graph_compute: nodes=%d ops=%u submits=%u batch_size=%u ops_per_submit_avg=%.1f\n",
+            cgraph->n_nodes,
+            trace_total_ops,
+            trace_total_submits,
+            ctx->global_ctx->command_submit_batch_size,
+            trace_total_submits ? (double) trace_total_ops / trace_total_submits : 0.0);
+    fflush(stderr);
+#endif
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
     ggml_backend_webgpu_collect_profile_results(ctx, profile_pipeline_names, num_inflight_batches);
