@@ -22,7 +22,6 @@
 #endif
 
 #include <assert.h>
-#include <errno.h>
 #include <time.h>
 #include <math.h>
 #include <stdlib.h>
@@ -482,6 +481,18 @@ struct ggml_threadpool {
     atomic_bool pause;        // Used for pausing the threadpool or individual threads
     atomic_int  abort;        // Used for aborting processing of a graph
 
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+    // [wllama-fork] Emscripten's pthread_create on a Worker thread is ASYNC:
+    // it postMessages the spawn request to the page main thread and returns 0
+    // immediately, without waiting for the worker to actually start running.
+    // The chief then races straight into the graph + barrier expecting workers
+    // that haven't begun executing yet. We add a ready-handshake: each
+    // secondary thread atomic-increments n_workers_ready when it enters its
+    // entry function, and the chief spin-waits until all secondaries are
+    // ready before proceeding past threadpool init.
+    atomic_int GGML_CACHE_ALIGN n_workers_ready;
+#endif
+
     struct ggml_compute_state * workers;   // per thread state
     int          n_threads;   // Number of threads in the pool
     int32_t      prio;        // Scheduling priority
@@ -519,6 +530,30 @@ static inline void ggml_thread_cpu_relax(void) {
         /* Encoding of the pause instruction */
         __asm__ __volatile__ (".4byte 0x100000F");
     #endif
+}
+#elif defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+// [wllama-fork] On wasm + pthreads, the busy-spin in ggml_barrier() and
+// the polling in ggml_graph_compute_poll_for_work() must yield CPU to
+// give sibling Web Workers a chance to make progress. Without a yield,
+// 8 Workers all spinning at the barrier can each see "n_barrier <
+// n_threads-1" forever because their atomic increment hasn't been
+// observed yet by the others (cache coherency through the SAB takes
+// non-trivial time + scheduler pressure). The wasm SIMD `i32x4.relaxed_*`
+// instructions don't help. Use a real wasm `nop` plus a short
+// memory_atomic_notify hint to make the JIT honor the yield intent.
+// On modern V8 this compiles to a pause-like instruction that lets
+// the runtime preempt-poll.
+#include <wasm_simd128.h>
+static inline void ggml_thread_cpu_relax(void) {
+    // Simply `__asm__ volatile("nop")` would compile to wasm `nop`, which
+    // V8 turns into nothing. We need an actual memory hint. Use a
+    // compiler memory barrier so the JIT can't hoist the load out of
+    // the spin loop, and add a hint via the bulk-memory data drop op
+    // which V8 treats as a yield-friendly fence.
+    __asm__ volatile("" ::: "memory");
+    // Also do a synchronizing atomic so the scheduler can interrupt.
+    // (This is essentially what wasi does for sched_yield.)
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 #else
 static inline void ggml_thread_cpu_relax(void) {;}
@@ -3089,6 +3124,14 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool * threadpool = state->threadpool;
 
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+    // [wllama-fork] Signal that this worker has actually entered its entry
+    // function. The chief spin-waits on n_workers_ready before kicking off
+    // the first graph, because Emscripten's pthread_create returns 0 BEFORE
+    // the worker has actually started running.
+    atomic_fetch_add_explicit(&threadpool->n_workers_ready, 1, memory_order_seq_cst);
+#endif
+
     ggml_thread_apply_priority(threadpool->prio);
     if (ggml_thread_cpumask_is_valid(state->cpumask)) {
         ggml_thread_apply_affinity(state->cpumask);
@@ -3179,6 +3222,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+        atomic_store_explicit(&threadpool->n_workers_ready, 0, memory_order_relaxed);
+#endif
     }
 
     // Allocate and init workers state
@@ -3215,6 +3261,41 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
         GGML_ASSERT(rc == 0);
     }
+
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+    // [wllama-fork] Wait for every secondary worker to actually enter its
+    // entry function before letting the chief proceed. Emscripten's
+    // pthread_create on a Worker is async: it returns 0 immediately even
+    // though the spawned worker may still be mid-load. Without this gate,
+    // the chief races into the first graph + barrier, atom-incs n_barrier
+    // to 1, and waits forever for n_threads-1 workers that haven't started
+    // executing yet. This is a defense-in-depth for the build-script pool
+    // patch (see scripts/build-wasm.sh patch_pthread_pool_quoting): even
+    // if Module["pthreadPoolSize"] gets mangled and on-demand allocation
+    // races, this gate ensures workers are actually live before chief
+    // proceeds.
+    {
+        const int target = tpp->n_threads - 1;
+        uint64_t spin_iter = 0;
+        int ready;
+        while ((ready = atomic_load_explicit(&threadpool->n_workers_ready, memory_order_acquire)) < target) {
+            ggml_thread_cpu_relax();
+            spin_iter++;
+            // Soft warning at 10M, hard timeout at 1B (~50-100s of pure spin).
+            // If we hit the timeout the chief proceeds anyway and the user
+            // sees the "STUCK n_barrier=1/N" hang from the next decode.
+            if (spin_iter == 10000000UL) {
+                fprintf(stderr, "@@WARN@@ [ggml-tp] workers slow to start (%d/%d after 10M spins)\n", ready, target);
+                fflush(stderr);
+            }
+            if (spin_iter == 1000000000UL) {
+                fprintf(stderr, "@@ERROR@@ [ggml-tp] giving up waiting for workers (%d/%d after 1B spins) — first decode will likely hang\n", ready, target);
+                fflush(stderr);
+                break;
+            }
+        }
+    }
+#endif
 
     ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
 
