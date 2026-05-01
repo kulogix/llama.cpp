@@ -1273,21 +1273,53 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_set_rows(webgpu_context & ct
 
     auto * decisions = static_cast<ggml_webgpu_set_rows_shader_decisions *>(pipeline.context.get());
 
-    std::vector<uint32_t> params = {
-        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src) / ggml_type_size(src->type)),
-        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, idx) / ggml_type_size(idx->type)),
-        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
-        // Convert byte-strides to element-strides
-        (uint32_t) (src->nb[1] / ggml_type_size(src->type)), (uint32_t) (src->nb[2] / ggml_type_size(src->type)),
-        (uint32_t) (src->nb[3] / ggml_type_size(src->type)), (uint32_t) (idx->nb[0] / ggml_type_size(idx->type)),
-        (uint32_t) (idx->nb[1] / ggml_type_size(idx->type)), (uint32_t) (idx->nb[2] / ggml_type_size(idx->type)),
-        (uint32_t) (dst->nb[1] / ggml_type_size(dst->type)), (uint32_t) (dst->nb[2] / ggml_type_size(dst->type)),
-        (uint32_t) (dst->nb[3] / ggml_type_size(dst->type)),
-        // Shape of src
-        (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
-        // Shape of idx
-        (uint32_t) (idx->ne[1]), (uint32_t) (idx->ne[2])
-    };
+    std::vector<uint32_t> params;
+    if (decisions->q8_0_row_per_wg) {
+        // [wllama-fork 2026-05-01] q8_0 dst path: pass byte-strides for dst
+        // (since the shader treats dst as `array<u32>` and addresses bytes
+        // directly via the q8_0 block layout). src and idx still use
+        // element-strides per ggml's normal convention.
+        const uint32_t dst_offset_bytes =
+            (uint32_t) ggml_webgpu_tensor_misalignment(ctx, dst);
+        params = {
+            (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src) / ggml_type_size(src->type)),
+            (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, idx) / ggml_type_size(idx->type)),
+            dst_offset_bytes,
+            // src strides (elements)
+            (uint32_t) (src->nb[1] / ggml_type_size(src->type)),
+            (uint32_t) (src->nb[2] / ggml_type_size(src->type)),
+            (uint32_t) (src->nb[3] / ggml_type_size(src->type)),
+            // idx strides (elements)
+            (uint32_t) (idx->nb[0] / ggml_type_size(idx->type)),
+            (uint32_t) (idx->nb[1] / ggml_type_size(idx->type)),
+            (uint32_t) (idx->nb[2] / ggml_type_size(idx->type)),
+            // dst strides (BYTES — q8_0 shader expects byte offsets)
+            (uint32_t) dst->nb[1],
+            (uint32_t) dst->nb[2],
+            (uint32_t) dst->nb[3],
+            // src shape
+            (uint32_t) src->ne[0], (uint32_t) src->ne[1],
+            (uint32_t) src->ne[2], (uint32_t) src->ne[3],
+            // idx shape
+            (uint32_t) idx->ne[1], (uint32_t) idx->ne[2],
+        };
+    } else {
+        params = {
+            (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src) / ggml_type_size(src->type)),
+            (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, idx) / ggml_type_size(idx->type)),
+            (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+            // Convert byte-strides to element-strides
+            (uint32_t) (src->nb[1] / ggml_type_size(src->type)), (uint32_t) (src->nb[2] / ggml_type_size(src->type)),
+            (uint32_t) (src->nb[3] / ggml_type_size(src->type)), (uint32_t) (idx->nb[0] / ggml_type_size(idx->type)),
+            (uint32_t) (idx->nb[1] / ggml_type_size(idx->type)), (uint32_t) (idx->nb[2] / ggml_type_size(idx->type)),
+            (uint32_t) (dst->nb[1] / ggml_type_size(dst->type)), (uint32_t) (dst->nb[2] / ggml_type_size(dst->type)),
+            (uint32_t) (dst->nb[3] / ggml_type_size(dst->type)),
+            // Shape of src
+            (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
+            // Shape of idx
+            (uint32_t) (idx->ne[1]), (uint32_t) (idx->ne[2])
+        };
+    }
 
     std::vector<wgpu::BindGroupEntry> entries = {
         ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src),
@@ -1300,13 +1332,19 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_set_rows(webgpu_context & ct
                                                             ctx->set_rows_dev_error_buf.GetSize()));
     }
 
-    uint32_t threads;
-    if (decisions->vec4) {
-        threads = (src->ne[1] * src->ne[2] * src->ne[3]) * (src->ne[0] / 4);
+    uint32_t wg_x;
+    if (decisions->q8_0_row_per_wg) {
+        // 1 workgroup per dst row, each workgroup writes head_dim threads.
+        wg_x = (uint32_t) (src->ne[1] * src->ne[2] * src->ne[3]);
     } else {
-        threads = src->ne[0] * src->ne[1] * src->ne[2] * src->ne[3];
+        uint32_t threads;
+        if (decisions->vec4) {
+            threads = (src->ne[1] * src->ne[2] * src->ne[3]) * (src->ne[0] / 4);
+        } else {
+            threads = src->ne[0] * src->ne[1] * src->ne[2] * src->ne[3];
+        }
+        wg_x = CEIL_DIV(threads, decisions->wg_size);
     }
-    uint32_t wg_x = CEIL_DIV(threads, decisions->wg_size);
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, 1);
 }
 
@@ -3869,8 +3907,26 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                           (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_I32);
             break;
         case GGML_OP_SET_ROWS:
+            // [wllama-fork 2026-05-01] Added Q8_0 dst support via the new
+            // wgsl-shaders/set_rows_q8_0.wgsl (workgroup-per-row dispatch +
+            // f16-scale round-trip per ggml's q8_0 recipe).
+            //
+            // Constraints:
+            //   head_dim % 64 == 0     -- so row stride aligns to u32 boundary
+            //                            (block_size_bytes=34, requires even
+            //                            blocks_per_row to keep rows aligned)
+            //   head_dim     <= 256    -- WGSL workgroup_size cap; the shader
+            //                            uses one thread per element with no
+            //                            multi-element looping yet. Gemma-4
+            //                            E2B has head_dim=512, so it stays on
+            //                            the f16 KV path until we restructure
+            //                            the shader (multi-element-per-thread
+            //                            with shared-memory reduction).
             supports_op = ((op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) && src0->type == GGML_TYPE_F32 &&
-                           (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32));
+                           (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32)) ||
+                          (op->type == GGML_TYPE_Q8_0 && src0->type == GGML_TYPE_F32 &&
+                           (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32) &&
+                           op->ne[0] % 64 == 0 && op->ne[0] <= 256);
             break;
         case GGML_OP_GET_ROWS:
             if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_webgpu_supported_qtype(src0->type)) {

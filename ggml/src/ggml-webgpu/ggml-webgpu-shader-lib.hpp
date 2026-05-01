@@ -158,6 +158,12 @@ struct ggml_webgpu_set_rows_shader_decisions {
     bool     vec4;
     bool     i64_idx;
     uint32_t wg_size;
+    // [wllama-fork 2026-05-01] q8_0 path uses a different dispatch model:
+    // 1 workgroup per dst row (instead of flat element-parallel), with
+    // wg_size == head_dim. This flag tells the dispatcher to use the
+    // row-based grid + byte-stride params instead of the element-parallel
+    // flat grid. See wgsl-shaders/set_rows_q8_0.wgsl for the recipe.
+    bool     q8_0_row_per_wg;
 };
 
 /** Set **/
@@ -1094,8 +1100,10 @@ class ggml_webgpu_shader_lib {
     webgpu_pipeline get_set_rows_pipeline(const ggml_webgpu_shader_lib_context & context) {
         ggml_webgpu_set_rows_pipeline_key key = {};
         key.dst_type                          = context.dst->type;
-        key.vec4                              = context.src0->ne[0] % 4 == 0;
-        key.i64_idx                           = context.src1->type == GGML_TYPE_I64;
+        // For q8_0 dst the vec4 fast-path doesn't apply (dst is byte-packed);
+        // ignore the src vec4 bit so the cache key doesn't fragment.
+        key.vec4    = (context.dst->type == GGML_TYPE_Q8_0) ? 0 : (context.src0->ne[0] % 4 == 0);
+        key.i64_idx = context.src1->type == GGML_TYPE_I64;
 
         auto it = set_rows_pipelines.find(key);
         if (it != set_rows_pipelines.end()) {
@@ -1104,6 +1112,14 @@ class ggml_webgpu_shader_lib {
 
         std::vector<std::string> defines;
         std::string              variant = "set_rows";
+
+        // [wllama-fork 2026-05-01] q8_0 dst uses a separate WGSL with a
+        // row-per-workgroup dispatch + per-element parallel quantize. The
+        // wg_size is set to head_dim (= dst->ne[0]) at shader-compile time
+        // so each thread handles exactly one element.
+        bool          q8_0_path = (context.dst->type == GGML_TYPE_Q8_0);
+        const char *  shader_src = wgsl_set_rows;
+        uint32_t      effective_wg_size = context.max_wg_size;
 
         switch (context.dst->type) {
             case GGML_TYPE_F32:
@@ -1114,11 +1130,18 @@ class ggml_webgpu_shader_lib {
                 defines.push_back("DST_F16");
                 variant += "_dstf16";
                 break;
+            case GGML_TYPE_Q8_0:
+                shader_src = wgsl_set_rows_q8_0;
+                variant    = "set_rows_q8_0";
+                // wg_size = head_dim. Cap at 256 (WGSL workgroup_size limit
+                // we're targeting; matches MAX_HEAD_DIM in the shader).
+                effective_wg_size = std::min<uint32_t>(256u, (uint32_t) context.dst->ne[0]);
+                break;
             default:
                 GGML_ABORT("Unsupported dst type for set_rows shader");
         }
 
-        if (key.vec4) {
+        if (!q8_0_path && key.vec4) {
             defines.push_back("VEC4");
             variant += "_vec4";
         }
@@ -1127,13 +1150,14 @@ class ggml_webgpu_shader_lib {
             variant += "_i64idx";
         }
 
-        defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
+        defines.push_back(std::string("WG_SIZE=") + std::to_string(effective_wg_size));
 
-        auto processed                  = preprocessor.preprocess(wgsl_set_rows, defines);
+        auto processed                  = preprocessor.preprocess(shader_src, defines);
         auto decisions                  = std::make_shared<ggml_webgpu_set_rows_shader_decisions>();
         decisions->vec4                 = key.vec4;
         decisions->i64_idx              = key.i64_idx;
-        decisions->wg_size              = context.max_wg_size;
+        decisions->wg_size              = effective_wg_size;
+        decisions->q8_0_row_per_wg      = q8_0_path;
         set_rows_pipelines[key]         = ggml_webgpu_create_pipeline(device, processed, variant);
         set_rows_pipelines[key].context = decisions;
         return set_rows_pipelines[key];
