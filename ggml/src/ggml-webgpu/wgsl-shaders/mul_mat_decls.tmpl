@@ -636,74 +636,167 @@ fn init_shmem_src0(thread_id: u32, batch_offset: u32, offset_m: u32, k_outer: u3
 const BLOCK_SIZE = 256u;
 const BLOCK_SIZE_BYTES = 210u;
 
+// [wllama-fork Phase A.8] Vectorized Q6_K dequant — 4 elements per
+// thread per outer iter instead of 1. Each thread loads ONE 4-byte
+// ql word + ONE 4-byte qh word per pass (instead of 3 separate
+// scalar loads per element), then unpacks via wgsl built-in
+// unpack4xU8 to get a vec4<u32> of byte values, processes all 4
+// dequant outputs as vec4<f16>, and stores 4 contiguous shmem
+// entries.
+//
+// Why this is safe: TILE_K = 32 (constant, see
+// WEBGPU_MUL_MAT_REG_TILE_K_QUANT in shader-lib.hpp:34). 32 % 4 == 0,
+// so 4 consecutive elem_idx values within one thread's pass always
+// stay within ONE shmem row (same tile_m, same global_m). All 4
+// also stay within ONE Q6_K quarter (since each quarter is 32
+// elements wide), so they share the same scale + d values, and
+// their ql/qh byte positions are 4 consecutive bytes — exactly one
+// u32-aligned read.
+//
+// Estimated win per the WebGPU ceiling analysis at
+// research/webgpu-ceiling-analysis-2026-04-30.md: +25-35% on Q6_K
+// matmul throughput (fewer scalar bit-twiddle ops, fewer u32
+// loads, better ALU utilization).
+//
+// Falls back to per-element scalar handling at row boundaries
+// (when remaining elements < 4) and OOB padding.
 fn init_shmem_src0(thread_id: u32, batch_offset: u32, offset_m: u32, k_outer: u32) {
-    for (var elem_idx = thread_id; elem_idx < TILE_SRC0_SHMEM; elem_idx += TOTAL_WORKGROUP_SIZE) {
+    // Stride of 4 elements per thread per outer iter.
+    for (var elem_idx = thread_id * 4u; elem_idx < TILE_SRC0_SHMEM; elem_idx += TOTAL_WORKGROUP_SIZE * 4u) {
         let tile_m = elem_idx / TILE_K;
         let tile_k = elem_idx % TILE_K;
 
         let global_m = offset_m + tile_m;
-        let global_k = k_outer + tile_k;
+        let global_k_base = k_outer + tile_k;
 
-        if (global_m >= params.m || global_k >= params.k) {
-            shmem[elem_idx] = f16(0.0);
+        // OOB check: if any of the 4 elements is out of bounds, fall
+        // back to the per-element path (rare — only at edge tiles).
+        let any_oob = (global_m >= params.m) || (global_k_base + 3u >= params.k);
+        if (any_oob || (tile_k + 4u > TILE_K)) {
+            // Per-element scalar fallback. Same logic as the original
+            // pre-vectorize implementation.
+            for (var ei = 0u; ei < 4u; ei = ei + 1u) {
+                let cur_idx = elem_idx + ei;
+                if (cur_idx >= TILE_SRC0_SHMEM) {
+                    break;
+                }
+                let cur_tile_m = cur_idx / TILE_K;
+                let cur_tile_k = cur_idx % TILE_K;
+                let cur_gm = offset_m + cur_tile_m;
+                let cur_gk = k_outer + cur_tile_k;
+                if (cur_gm >= params.m || cur_gk >= params.k) {
+                    shmem[cur_idx] = f16(0.0);
+                    continue;
+                }
+                let cb_blk_k = cur_gk / BLOCK_SIZE;
+                let cb_kib = cur_gk % BLOCK_SIZE;
+                let cb_src0 = batch_offset + cur_gm * params.stride_01 + cb_blk_k;
+                let cb_bbase = cb_src0 * BLOCK_SIZE_BYTES;
+                let cb_half = cb_kib / 128u;
+                let cb_poh = cb_kib % 128u;
+                let cb_q = cb_poh / 32u;
+                let cb_l = cb_poh % 32u;
+                let cb_qlb = cb_half * 64u;
+                let cb_qhb = cb_half * 32u;
+                let cb_scb = cb_half * 8u;
+                let cb_ql13 = get_byte(load_u32_at_src0(cb_bbase + cb_qlb + cb_l), 0u);
+                let cb_ql24 = get_byte(load_u32_at_src0(cb_bbase + cb_qlb + cb_l + 32u), 0u);
+                let cb_qh   = get_byte(load_u32_at_src0(cb_bbase + 128u + cb_qhb + cb_l), 0u);
+                let cb_q1 = f16((cb_ql13 & 0xFu) | ((cb_qh & 3u) << 4u)) - f16(32.0);
+                let cb_q2 = f16((cb_ql24 & 0xFu) | (((cb_qh >> 2u) & 3u) << 4u)) - f16(32.0);
+                let cb_q3 = f16((cb_ql13 >> 4u) | (((cb_qh >> 4u) & 3u) << 4u)) - f16(32.0);
+                let cb_q4 = f16((cb_ql24 >> 4u) | (((cb_qh >> 6u) & 3u) << 4u)) - f16(32.0);
+                let cb_is = cb_l / 16u;
+                let cb_sc = get_byte_i32(load_u32_at_src0(cb_bbase + 192u + cb_scb + cb_is + cb_q * 2u), 0u);
+                let cb_d = load_f16_at_src0(cb_bbase + 208u);
+                var cb_qv: f16;
+                if (cb_q == 0u) { cb_qv = cb_q1; }
+                else if (cb_q == 1u) { cb_qv = cb_q2; }
+                else if (cb_q == 2u) { cb_qv = cb_q3; }
+                else { cb_qv = cb_q4; }
+                shmem[cur_idx] = cb_d * f16(cb_sc) * cb_qv;
+            }
             continue;
         }
 
-        let block_k = global_k / BLOCK_SIZE;
-        let k_in_block = global_k % BLOCK_SIZE;
-
+        // ── Fast path: 4 in-bounds elements within one row, one quarter ──
+        // All 4 elements share: block, half, quarter, scale (since they're
+        // within a 16-element subblock).
+        let block_k = global_k_base / BLOCK_SIZE;
+        let k_in_block = global_k_base % BLOCK_SIZE;
         let src0_idx = batch_offset + global_m * params.stride_01 + block_k;
         let block_byte_base = src0_idx * BLOCK_SIZE_BYTES;
 
         let half = k_in_block / 128u;
         let pos_in_half = k_in_block % 128u;
         let quarter = pos_in_half / 32u;
-        let l = pos_in_half % 32u;
+        let l_base = pos_in_half % 32u;
 
         let ql_b_idx = half * 64u;
         let qh_b_idx = half * 32u;
         let sc_b_idx = half * 8u;
 
-        // Load only ql13 word needed
-        let ql13_flat = ql_b_idx + l;
-        let ql13 = load_u32_at_src0(block_byte_base + ql13_flat);
-        let ql13_b = get_byte(ql13, 0u);
+        // Load 4 consecutive ql bytes for the "lower" region (used by
+        // quarter 0 → low nibble, quarter 2 → high nibble) via ONE u32.
+        let ql13_word = load_u32_at_src0(block_byte_base + ql_b_idx + l_base);
+        let ql13_v = unpack4xU8(ql13_word);  // vec4<u32> of 4 bytes
 
-        // Load only ql24 word needed
-        let ql24_flat = ql_b_idx + l + 32u;
-        let ql24 = load_u32_at_src0(block_byte_base + ql24_flat);
-        let ql24_b = get_byte(ql24, 0u);
+        // Load 4 consecutive ql bytes for the "upper" region (used by
+        // quarter 1 → low nibble, quarter 3 → high nibble).
+        let ql24_word = load_u32_at_src0(block_byte_base + ql_b_idx + l_base + 32u);
+        let ql24_v = unpack4xU8(ql24_word);
 
-        // Load only qh word needed
-        let qh_flat = qh_b_idx + l;
-        let qh = load_u32_at_src0(block_byte_base + 128u + qh_flat);
-        let qh_b = get_byte(qh, 0u);
+        // Load 4 consecutive qh bytes via ONE u32.
+        let qh_word = load_u32_at_src0(block_byte_base + 128u + qh_b_idx + l_base);
+        let qh_v = unpack4xU8(qh_word);
 
-        let q1 = f16((ql13_b & 0xFu) | ((qh_b & 3u) << 4u)) - f16(32.0);
-        let q2 = f16((ql24_b & 0xFu) | (((qh_b >> 2u) & 3u) << 4u)) - f16(32.0);
-        let q3 = f16((ql13_b >> 4u) | (((qh_b >> 4u) & 3u) << 4u)) - f16(32.0);
-        let q4 = f16((ql24_b >> 4u) | (((qh_b >> 6u) & 3u) << 4u)) - f16(32.0);
-
-        // Load only the scale word needed
-        let is = l / 16u;
-        let sc_idx = sc_b_idx + is + quarter * 2u;
-        let sc = load_u32_at_src0(block_byte_base + 192u + sc_idx);
-        let sc_val = get_byte_i32(sc, 0u);
-
-        let d = load_f16_at_src0(block_byte_base + 208u);
-
-        var q_val: f16;
-        if (quarter == 0u) {
-            q_val = q1;
-        } else if (quarter == 1u) {
-            q_val = q2;
-        } else if (quarter == 2u) {
-            q_val = q3;
-        } else {
-            q_val = q4;
+        // Compute the 4 dequant values (using vec4 math). Selecting which
+        // quarter formula to use based on quarter id, but this is uniform
+        // across the 4 elements (they share the quarter), so the branch
+        // is cheap.
+        var quad: vec4<f16>;
+        switch quarter {
+            case 0u: {
+                // a = (ql13 & 0xF) | ((qh & 3) << 4) - 32
+                let lo = ql13_v & vec4<u32>(0xFu);
+                let hi = (qh_v & vec4<u32>(3u)) << vec4<u32>(4u);
+                let combined = lo | hi;
+                quad = vec4<f16>(f16(combined.x), f16(combined.y), f16(combined.z), f16(combined.w)) - vec4<f16>(32.0);
+            }
+            case 1u: {
+                let lo = ql24_v & vec4<u32>(0xFu);
+                let hi = ((qh_v >> vec4<u32>(2u)) & vec4<u32>(3u)) << vec4<u32>(4u);
+                let combined = lo | hi;
+                quad = vec4<f16>(f16(combined.x), f16(combined.y), f16(combined.z), f16(combined.w)) - vec4<f16>(32.0);
+            }
+            case 2u: {
+                let lo = ql13_v >> vec4<u32>(4u);
+                let hi = ((qh_v >> vec4<u32>(4u)) & vec4<u32>(3u)) << vec4<u32>(4u);
+                let combined = lo | hi;
+                quad = vec4<f16>(f16(combined.x), f16(combined.y), f16(combined.z), f16(combined.w)) - vec4<f16>(32.0);
+            }
+            default: {  // quarter == 3
+                let lo = ql24_v >> vec4<u32>(4u);
+                let hi = ((qh_v >> vec4<u32>(6u)) & vec4<u32>(3u)) << vec4<u32>(4u);
+                let combined = lo | hi;
+                quad = vec4<f16>(f16(combined.x), f16(combined.y), f16(combined.z), f16(combined.w)) - vec4<f16>(32.0);
+            }
         }
 
-        shmem[elem_idx] = d * f16(sc_val) * q_val;
+        // One scale + one d per 4-element group (they share the
+        // 16-element subblock since 4 ≤ 16 and we're 4-aligned).
+        let is = l_base / 16u;
+        let sc_idx = sc_b_idx + is + quarter * 2u;
+        let sc = get_byte_i32(load_u32_at_src0(block_byte_base + 192u + sc_idx), 0u);
+        let d = load_f16_at_src0(block_byte_base + 208u);
+        let scale_d = d * f16(sc);
+
+        // Store 4 f16 results (scaled) into 4 contiguous shmem entries.
+        let scaled = quad * vec4<f16>(scale_d);
+        shmem[elem_idx + 0u] = scaled.x;
+        shmem[elem_idx + 1u] = scaled.y;
+        shmem[elem_idx + 2u] = scaled.z;
+        shmem[elem_idx + 3u] = scaled.w;
     }
 }
 #endif // INIT_SRC0_SHMEM_Q6_K
