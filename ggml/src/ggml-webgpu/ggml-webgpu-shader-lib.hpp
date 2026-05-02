@@ -138,9 +138,18 @@ struct ggml_webgpu_set_rows_pipeline_key {
     int dst_type;
     int vec4;
     int i64_idx;
+    // [wllama-fork 2026-05-01] q8_0 dst path bakes WG_SIZE and
+    // ELEMS_PER_THREAD into the WGSL at compile time as a function of
+    // head_dim. Models with mixed head_dims per layer would silently get
+    // the wrong pipeline if head_dim weren't part of the cache key. For
+    // non-q8_0 paths head_dim is irrelevant (the f16/f32 set_rows shader
+    // uses a flat element-parallel grid sized at dispatch time) and we
+    // store 0 to keep the cache compact.
+    int head_dim;
 
     bool operator==(const ggml_webgpu_set_rows_pipeline_key & other) const {
-        return dst_type == other.dst_type && vec4 == other.vec4 && i64_idx == other.i64_idx;
+        return dst_type == other.dst_type && vec4 == other.vec4 && i64_idx == other.i64_idx &&
+               head_dim == other.head_dim;
     }
 };
 
@@ -150,6 +159,7 @@ struct ggml_webgpu_set_rows_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.dst_type);
         ggml_webgpu_hash_combine(seed, key.vec4);
         ggml_webgpu_hash_combine(seed, key.i64_idx);
+        ggml_webgpu_hash_combine(seed, key.head_dim);
         return seed;
     }
 };
@@ -1110,6 +1120,10 @@ class ggml_webgpu_shader_lib {
         // ignore the src vec4 bit so the cache key doesn't fragment.
         key.vec4    = (context.dst->type == GGML_TYPE_Q8_0) ? 0 : (context.src0->ne[0] % 4 == 0);
         key.i64_idx = context.src1->type == GGML_TYPE_I64;
+        // [wllama-fork 2026-05-01] q8_0 path: head_dim controls WG_SIZE and
+        // ELEMS_PER_THREAD compile-time (see set_rows_q8_0.wgsl). Other paths
+        // are head_dim-agnostic — leave at 0 so they share one pipeline.
+        key.head_dim = (context.dst->type == GGML_TYPE_Q8_0) ? (int) context.dst->ne[0] : 0;
 
         auto it = set_rows_pipelines.find(key);
         if (it != set_rows_pipelines.end()) {
@@ -1120,12 +1134,20 @@ class ggml_webgpu_shader_lib {
         std::string              variant = "set_rows";
 
         // [wllama-fork 2026-05-01] q8_0 dst uses a separate WGSL with a
-        // row-per-workgroup dispatch + per-element parallel quantize. The
-        // wg_size is set to head_dim (= dst->ne[0]) at shader-compile time
-        // so each thread handles exactly one element.
+        // row-per-workgroup dispatch + per-element-parallel quantize.
+        //
+        // Two-tier WG_SIZE strategy (matches set_rows_q8_0.wgsl):
+        //   head_dim <= 256: WG_SIZE = head_dim, ELEMS_PER_THREAD = 1
+        //                    (each thread handles 1 element — original
+        //                     simple path; bit-identical to pre-rewrite)
+        //   head_dim >  256: WG_SIZE = 256, ELEMS_PER_THREAD = head_dim/256
+        //                    (each thread handles a STRIDED set of
+        //                     elements — unlocks gemma-4 head_dim=512 etc.,
+        //                     cap at MAX_HEAD_DIM=1024 in shader)
         bool          q8_0_path = (context.dst->type == GGML_TYPE_Q8_0);
         const char *  shader_src = wgsl_set_rows;
         uint32_t      effective_wg_size = context.max_wg_size;
+        uint32_t      q8_0_elems_per_thread = 1u;
 
         switch (context.dst->type) {
             case GGML_TYPE_F32:
@@ -1136,13 +1158,22 @@ class ggml_webgpu_shader_lib {
                 defines.push_back("DST_F16");
                 variant += "_dstf16";
                 break;
-            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q8_0: {
                 shader_src = wgsl_set_rows_q8_0;
                 variant    = "set_rows_q8_0";
-                // wg_size = head_dim. Cap at 256 (WGSL workgroup_size limit
-                // we're targeting; matches MAX_HEAD_DIM in the shader).
-                effective_wg_size = std::min<uint32_t>(256u, (uint32_t) context.dst->ne[0]);
+                const uint32_t hd = (uint32_t) context.dst->ne[0];
+                if (hd <= 256u) {
+                    effective_wg_size     = hd;
+                    q8_0_elems_per_thread = 1u;
+                } else {
+                    effective_wg_size     = 256u;
+                    q8_0_elems_per_thread = hd / 256u;
+                    // Tag variant so per-size pipeline shows up distinctly in
+                    // any pipeline-cache UI / shader name dumps.
+                    variant += "_hd" + std::to_string(hd);
+                }
                 break;
+            }
             default:
                 GGML_ABORT("Unsupported dst type for set_rows shader");
         }
@@ -1157,6 +1188,9 @@ class ggml_webgpu_shader_lib {
         }
 
         defines.push_back(std::string("WG_SIZE=") + std::to_string(effective_wg_size));
+        if (q8_0_path) {
+            defines.push_back(std::string("ELEMS_PER_THREAD=") + std::to_string(q8_0_elems_per_thread));
+        }
 
         auto processed                  = preprocessor.preprocess(shader_src, defines);
         auto decisions                  = std::make_shared<ggml_webgpu_set_rows_shader_decisions>();

@@ -4213,18 +4213,21 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             //   head_dim % 64 == 0     -- so row stride aligns to u32 boundary
             //                            (block_size_bytes=34, requires even
             //                            blocks_per_row to keep rows aligned)
-            //   head_dim     <= 256    -- WGSL workgroup_size cap; the shader
-            //                            uses one thread per element with no
-            //                            multi-element looping yet. Gemma-4
-            //                            E2B has head_dim=512, so it stays on
-            //                            the f16 KV path until we restructure
-            //                            the shader (multi-element-per-thread
-            //                            with shared-memory reduction).
+            //   head_dim ≤ 256 (EPT=1) OR head_dim == 512 (EPT=2)
+            //                          -- shader unrolls EPT={1,2} explicitly
+            //                            because Tint rejects barriers in
+            //                            variable-bound for-loops (even with
+            //                            compile-constant bounds). EPT=3,4
+            //                            (head_dim 768, 1024) are valid in
+            //                            principle but need adding two more
+            //                            unrolled passes per phase. No KV in
+            //                            current model zoo uses 768/1024.
+            //                          MAX_HEAD_DIM in shader = 512 (matches).
             supports_op = ((op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) && src0->type == GGML_TYPE_F32 &&
                            (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32)) ||
                           (op->type == GGML_TYPE_Q8_0 && src0->type == GGML_TYPE_F32 &&
                            (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32) &&
-                           op->ne[0] % 64 == 0 && op->ne[0] <= 256);
+                           op->ne[0] % 64 == 0 && (op->ne[0] <= 256 || op->ne[0] == 512));
             break;
         case GGML_OP_GET_ROWS:
             if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_webgpu_supported_qtype(src0->type)) {

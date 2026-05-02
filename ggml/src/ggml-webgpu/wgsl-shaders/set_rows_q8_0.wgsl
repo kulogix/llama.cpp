@@ -2,8 +2,8 @@
 //
 // Quantizes f32 source rows into ggml's block_q8_0 format and writes them
 // into the indexed dst rows. Unlocks q8_0 KV cache on the WebGPU backend
-// (previously SET_ROWS only handled f16/f32 dst, forcing wllama to use
-// f16 KV — see src/wllama.ts:181 + cpp/wllama.cpp KV-quant policy).
+// for any model up to head_dim=512 (gemma-4 E2B), with explicit unroll
+// for EPT={1,2}.
 //
 // q-quant recipe (block_q8_0):
 //   layout: { ggml_half d; int8_t qs[32]; } = 34 bytes
@@ -25,28 +25,61 @@
 //
 // Dispatch model:
 //   - 1 workgroup per dst row.
-//   - workgroup_size = HEAD_DIM (one thread per element). For typical KV
-//     head_dim = 64..256 this fits comfortably under WGSL's 256-thread max.
-//   - All threads quantize in parallel; thread 0 serializes the 17-68
-//     u32-word writes for the row (avoids the 34-byte misalignment race
-//     since blocks span u32 boundaries).
+//   - Two compile-time variants:
+//
+//     EPT=1 (head_dim ≤ 256): WG_SIZE = head_dim. Each thread handles one
+//                             element. Original simple path (bit-identical
+//                             to pre-2026-05-01 shipping behavior).
+//
+//     EPT=2 (head_dim = 512): WG_SIZE = 256. Each thread handles 2 elements
+//                             (strided: lane and lane+256). Two unrolled
+//                             passes for phase-1 load, phase-2 reduction,
+//                             phase-3 quantize. Lifts gemma-4's head_dim=512
+//                             above the previous 256-element cap.
+//
+//   - Why explicit unrolling rather than a `for (e in 0..EPT)` loop: WGSL's
+//     uniform-control-flow rule (required for workgroupBarrier) is checked
+//     statically by Tint, which is conservative about loops containing
+//     barriers. Even with a compile-constant bound (`for e < 2u`), Tint
+//     rejected the construct with `'workgroupBarrier' must only be called
+//     from uniform control flow`. Inlining the iterations explicitly puts
+//     every barrier at the top level of the function, where uniformity is
+//     trivially satisfied.
+//
+//   - EPT=3 (head_dim = 768) and EPT=4 (head_dim = 1024) would extend the
+//     same pattern with two more unrolled blocks per phase, but no current
+//     KV head_dim hits those — supports_op gates them out today. Add them
+//     when a model needs them.
 //
 // row size analysis (head_dim is multiple of 32 for q8_0):
-//   head_dim=32  -> 1 block,  34 bytes  (ROW NOT u32-ALIGNED — unsupported)
-//   head_dim=64  -> 2 blocks, 68 bytes  (aligned, ok)
-//   head_dim=128 -> 4 blocks, 136 bytes (aligned, ok)
-//   head_dim=256 -> 8 blocks, 272 bytes (aligned, ok)
-//   head_dim>=64 always aligns since (head_dim/32) * 34 is multiple of 4
-//   when head_dim/32 is even. We require head_dim % 64 == 0 for safety.
+//   head_dim=64  -> 2 blocks, 68 bytes  (aligned, EPT=1)
+//   head_dim=128 -> 4 blocks, 136 bytes (aligned, EPT=1)
+//   head_dim=256 -> 8 blocks, 272 bytes (aligned, EPT=1, original path)
+//   head_dim=512 -> 16 blocks, 544 bytes (aligned, EPT=2 — gemma-4 E2B)
+//
+// shared memory budget per workgroup (head_dim=512 worst case):
+//   sh_abs:        f32 × 512 = 2048 bytes
+//   sh_quant:      i32 × 512 = 2048 bytes
+//   sh_scale_bits: u32 × 16  =   64 bytes
+//   total:                      4160 bytes
+//   WebGPU minimum maxComputeWorkgroupStorageSize is 16 KB (Safari/Firefox).
+//   4× margin.
 
 #ifdef HAS_F16
 enable f16;
 #endif
 
-// HEAD_DIM is set per pipeline at compile time (= context.dst->ne[0]).
-// MAX_BLOCKS_PER_ROW caps shared-memory size; we support up to head_dim=256.
-const MAX_HEAD_DIM: u32 = 256u;
+// HEAD_DIM cap for shared-memory arrays. Keep at 512 until a model needs
+// EPT=3 or EPT=4 (then bump to 1024 + add the unrolled passes).
+const MAX_HEAD_DIM: u32 = 512u;
 const MAX_BLOCKS_PER_ROW: u32 = MAX_HEAD_DIM / 32u;
+
+// ELEMS_PER_THREAD must be set per pipeline at compile time (1 or 2). If
+// the build forgot to set it, default to 1 (back-compat with pre-rewrite
+// behavior).
+#ifndef ELEMS_PER_THREAD
+#define ELEMS_PER_THREAD 1
+#endif
 
 @group(0) @binding(0)
 var<storage, read_write> src: array<f32>;
@@ -104,6 +137,16 @@ var<workgroup> sh_abs:   array<f32, MAX_HEAD_DIM>;
 var<workgroup> sh_quant: array<i32, MAX_HEAD_DIM>;
 var<workgroup> sh_scale_bits: array<u32, MAX_BLOCKS_PER_ROW>;
 
+// Inline helper: per-block 32-element pairwise absmax reduction. Reads/writes
+// `sh_abs` in the [block_base, block_base+32) range. Each call places 5
+// barriers (16→8→4→2→1) — these are the only barriers in phase 2, and they
+// sit in the function body (not nested inside an outer loop) so Tint's
+// uniformity analysis trivially accepts them.
+//
+// Note: this is an inline manually-expanded pattern, NOT a function call —
+// WGSL doesn't support functions with workgroupBarrier in user code.
+// We invoke this PATTERN once per pass via copy-paste below.
+
 @compute @workgroup_size(WG_SIZE)
 fn main(@builtin(workgroup_id)        wg_id:    vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
@@ -129,11 +172,18 @@ fn main(@builtin(workgroup_id)        wg_id:    vec3<u32>,
                         + i_idx1 * params.stride_idx1
                         + i_idx2 * params.stride_idx2) * 2u;
     let idx_val = idx[idx_high_off];
-    let idx_hi  = idx[idx_high_off + 1u];
-    if (idx_hi != 0u) {
-        atomicStore(&error, 1u);
-        return;
-    }
+    // [wllama-fork 2026-05-01] On i64 overflow we set the host-readable error
+    // flag and continue with garbage dst contents. The host checks `error`
+    // after the dispatch completes and discards bad rows. We do NOT
+    // early-return here: subsequent workgroupBarriers require uniform CF, and
+    // Tint's analysis can't infer that the buffer-read driving the return is
+    // workgroup-uniform. Continuing the work is wasted compute on the (rare)
+    // overflow path but keeps the static uniformity proof simple.
+    //
+    // The atomicMax is deliberately unconditional so Tint cannot DCE the
+    // `error` binding (we observed v3 stripping binding 3 from the layout
+    // when the store was inside an `if (idx_hi != 0u)` block).
+    atomicMax(&error, u32(idx[idx_high_off + 1u] != 0u));
 #else
     let idx_off = params.offset_idx
                   + i_idx0 * params.stride_idx0
@@ -148,75 +198,146 @@ fn main(@builtin(workgroup_id)        wg_id:    vec3<u32>,
                       + i_src2 * params.stride_src2
                       + i_src3 * params.stride_src3;
 
-    // Skip threads outside head_dim (workgroup may be padded up).
-    let active = lane < head_dim;
-
-    // Load src element + record |x| for the block-amax reduction.
-    var x: f32 = 0.0;
-    if (active) {
-        x = src[src_row_off + lane];
-    }
-    sh_abs[lane] = abs(x);
+    // ===== PHASE 1: load src + sh_abs (unrolled per ELEMS_PER_THREAD) =====
+    //
+    // STRIDED ownership: pass `e` of thread `lane` owns element
+    // `e * WG_SIZE + lane`. For EPT=1 there's one pass; for EPT=2 there are
+    // two unrolled passes covering the full 512 elements with WG_SIZE=256.
+    //
+    // The per-thread loaded values stay in scalar locals (x0, x1) so phase 3
+    // doesn't need to re-read from src.
+    let elem0 = lane;                        // pass 0: lane in [0, WG_SIZE)
+    let v0 = src[src_row_off + elem0];
+    sh_abs[elem0] = abs(v0);
+#if ELEMS_PER_THREAD == 2
+    let elem1 = WG_SIZE + lane;              // pass 1: lane in [WG_SIZE, 2*WG_SIZE)
+    let v1 = src[src_row_off + elem1];
+    sh_abs[elem1] = abs(v1);
+#endif
     workgroupBarrier();
 
-    // Each thread participates in its own block's 32-element absmax reduction.
-    // Iterative pairwise max within shared memory — works regardless of
-    // subgroup size or whether subgroups are even available.
-    let block_in_row = lane / 32u;
+    // ===== PHASE 2: per-block 32-element absmax reduction (unrolled) =====
+    //
+    // Each block is 32 elements. WG_SIZE=256 covers blocks_per_pass = 8
+    // blocks at a time. Within each pass, threads 0..31 reduce block 0,
+    // threads 32..63 reduce block 1, etc.
+    //
+    // For EPT=1 (head_dim≤256) we have head_dim/32 blocks, with WG_SIZE = head_dim
+    // → blocks_per_pass = head_dim/32 → one pass covers ALL blocks. (Original
+    // behavior; bit-identical to pre-rewrite.)
+    //
+    // For EPT=2 (head_dim=512, WG_SIZE=256) we have 16 blocks total: pass 0
+    // covers blocks 0..7, pass 1 covers blocks 8..15.
+    //
+    // The 5-stage pairwise reduction (stride 16→8→4→2→1) is itself a for-loop
+    // with constant bounds — Tint accepts barriers in that loop because the
+    // bound (16) is a literal AND the loop is at the top level of the function
+    // (not nested inside another loop with barriers).
     let elem_in_block = lane % 32u;
-    let block_base = block_in_row * 32u;
 
-    // Stage reduction: 32 -> 16 -> 8 -> 4 -> 2 -> 1
-    for (var stride = 16u; stride > 0u; stride >>= 1u) {
-        if (elem_in_block < stride) {
-            let other = sh_abs[block_base + elem_in_block + stride];
-            sh_abs[block_base + elem_in_block] = max(sh_abs[block_base + elem_in_block], other);
+    // ---- Pass 0: blocks 0 .. (WG_SIZE/32 - 1) ----
+    {
+        let block_in_row = lane / 32u;
+        let block_base   = block_in_row * 32u;
+        for (var stride = 16u; stride > 0u; stride >>= 1u) {
+            if (elem_in_block < stride) {
+                let other = sh_abs[block_base + elem_in_block + stride];
+                sh_abs[block_base + elem_in_block] = max(sh_abs[block_base + elem_in_block], other);
+            }
+            workgroupBarrier();
         }
-        workgroupBarrier();
     }
-    let block_amax = sh_abs[block_base];
 
-    // Compute scale per the recipe: f32 -> f16-truncate -> use f16 value.
-    let scale_f32 = block_amax / 127.0;
-#ifdef HAS_F16
-    let scale_storage = f16(scale_f32);
-    let scale_for_dequant = f32(scale_storage);
-#else
-    // No f16 in shader: truncate manually via bitcast round-trip is messy.
-    // Best-effort: use the f32 scale unchanged (slight read/write mismatch).
-    let scale_storage = scale_f32;
-    let scale_for_dequant = scale_f32;
+#if ELEMS_PER_THREAD == 2
+    // ---- Pass 1: blocks (WG_SIZE/32) .. (2*WG_SIZE/32 - 1) ----
+    {
+        let block_in_row = (WG_SIZE / 32u) + lane / 32u;
+        let block_base   = block_in_row * 32u;
+        for (var stride = 16u; stride > 0u; stride >>= 1u) {
+            if (elem_in_block < stride) {
+                let other = sh_abs[block_base + elem_in_block + stride];
+                sh_abs[block_base + elem_in_block] = max(sh_abs[block_base + elem_in_block], other);
+            }
+            workgroupBarrier();
+        }
+    }
 #endif
-    let inv_scale = select(0.0, 1.0 / scale_for_dequant, block_amax > 0.0);
 
-    // Quantize this thread's element to i8 (range [-127, 127]).
-    if (active) {
-        let q = i32(round(x * inv_scale));
-        sh_quant[lane] = clamp(q, -127, 127);
-    } else {
-        sh_quant[lane] = 0;
-    }
+    // ===== PHASE 3: quantize + write per-block scale (unrolled) =====
+    //
+    // Each thread reads its block's amax from sh_abs[block_base], computes
+    // scale + inv_scale, quantizes its element. Thread `elem_in_block == 0`
+    // of each block writes the f16 scale's u16 bit pattern into
+    // sh_scale_bits[block_idx].
 
-    // Thread 0 of each block writes the f16 scale's u16 bit pattern into
-    // sh_scale_bits[block_in_row], so the row writer can splice it later.
-    if (elem_in_block == 0u && active) {
+    // ---- Pass 0 ----
+    {
+        let elem        = elem0;
+        let block_idx   = elem / 32u;
+        let elem_in_blk = elem % 32u;
+        let block_base  = block_idx * 32u;
+        let block_amax  = sh_abs[block_base];
+        let scale_f32   = block_amax / 127.0;
 #ifdef HAS_F16
-        // pack2x16float packs (lo, hi) f32 -> 2x f16 LSB pattern in low / high
-        // 16 bits respectively. We want the SAME f16 truncation we used for
-        // dequant. Going via bitcast<u32>(vec2(x, 0.0)) gives us the canonical
-        // IEEE 754 half encoding in low 16 bits.
-        let packed = pack2x16float(vec2<f32>(scale_f32, 0.0));
-        sh_scale_bits[block_in_row] = packed & 0xffffu;
+        let scale_storage     = f16(scale_f32);
+        let scale_for_dequant = f32(scale_storage);
 #else
-        // f32-fallback path: store low 16 bits of f32 (DOES NOT round-trip;
-        // marker only).
-        sh_scale_bits[block_in_row] = bitcast<u32>(scale_f32) & 0xffffu;
+        let scale_storage     = scale_f32;
+        let scale_for_dequant = scale_f32;
 #endif
+        let inv_scale = select(0.0, 1.0 / scale_for_dequant, block_amax > 0.0);
+        let q = i32(round(v0 * inv_scale));
+        sh_quant[elem] = clamp(q, -127, 127);
+
+        if (elem_in_blk == 0u) {
+#ifdef HAS_F16
+            let packed = pack2x16float(vec2<f32>(scale_f32, 0.0));
+            sh_scale_bits[block_idx] = packed & 0xffffu;
+#else
+            sh_scale_bits[block_idx] = bitcast<u32>(scale_f32) & 0xffffu;
+#endif
+        }
     }
+
+#if ELEMS_PER_THREAD == 2
+    // ---- Pass 1 ----
+    {
+        let elem        = elem1;
+        let block_idx   = elem / 32u;
+        let elem_in_blk = elem % 32u;
+        let block_base  = block_idx * 32u;
+        let block_amax  = sh_abs[block_base];
+        let scale_f32   = block_amax / 127.0;
+#ifdef HAS_F16
+        let scale_storage     = f16(scale_f32);
+        let scale_for_dequant = f32(scale_storage);
+#else
+        let scale_storage     = scale_f32;
+        let scale_for_dequant = scale_f32;
+#endif
+        let inv_scale = select(0.0, 1.0 / scale_for_dequant, block_amax > 0.0);
+        let q = i32(round(v1 * inv_scale));
+        sh_quant[elem] = clamp(q, -127, 127);
+
+        if (elem_in_blk == 0u) {
+#ifdef HAS_F16
+            let packed = pack2x16float(vec2<f32>(scale_f32, 0.0));
+            sh_scale_bits[block_idx] = packed & 0xffffu;
+#else
+            sh_scale_bits[block_idx] = bitcast<u32>(scale_f32) & 0xffffu;
+#endif
+        }
+    }
+#endif
+
     workgroupBarrier();
 
-    // Thread 0 serializes the row's u32 writes (avoids the 34-byte block-
-    // misalignment race; pure intra-workgroup writes, no atomics needed).
+    // ===== PHASE 4: lane 0 serializes the row's u32 writes =====
+    //
+    // Composes the 34-bytes-per-block layout (f16 scale + 32 i8s) into
+    // u32 words and writes them into dst. Pure intra-workgroup writes,
+    // no atomics needed (single thread). For head_dim=512 that's 136
+    // u32 words per row.
     if (lane == 0u) {
         let dst_row_byte_base = params.offset_dst
                                 + idx_val * params.stride_dst1
