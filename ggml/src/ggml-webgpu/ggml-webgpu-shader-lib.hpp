@@ -697,6 +697,38 @@ inline ggml_webgpu_flash_attn_decisions ggml_webgpu_flash_attn_get_decisions(
                      use_tile ? GGML_WEBGPU_FLASH_ATTN_PATH_TILE :
                                 GGML_WEBGPU_FLASH_ATTN_PATH_SUBGROUP_MATRIX;
 
+    // [wllama-fork 2026-05-01] Early-return safe sentinel decisions if the
+    // path landed on SUBGROUP_MATRIX but the device doesn't support it.
+    //
+    // Why: the subgroup-matrix branch below uses `context.sg_mat_n` as a
+    // divisor in kv_tile sizing (`sg_mat_n * PREFERRED_KV_SG_TILES`). On
+    // devices without subgroup-matrix, sg_mat_n == 0, making kv_tile == 0,
+    // which then traps with `remainder by zero` in the
+    // `KV_SEQ_PAD % decisions.kv_tile` loop further down.
+    //
+    // The crash is reachable when supports_op is called for a FA op whose
+    // type/shape combo lands on SUBGROUP_MATRIX (e.g. q8_0 KV at prefill,
+    // where seq_len_q >= 20 disqualifies VEC, and K!=f16 disqualifies TILE).
+    //
+    // The supports_op caller already rejects such ops (see
+    // ggml-webgpu.cpp:4353 — `if (!supports_subgroup_matrix) supports_op =
+    // false`), but only AFTER calling get_decisions. So we have to be safe
+    // here too. Returning sentinel-valid decisions (kv_tile=1) lets the
+    // caller's later check fire cleanly.
+    //
+    // Originally latent — unreachable before SET_ROWS-q8_0 head_dim>256
+    // support landed (commit b7238dff1). Now active when V=q8_0 with
+    // head_dim>256 is requested on a non-Apple-Silicon Chrome (or any
+    // Chrome without --enable-dawn-features=allow_unsafe_apis +
+    // WLLAMA_FORCE_SUBGROUP_MATRIX=1).
+    if (decisions.path == GGML_WEBGPU_FLASH_ATTN_PATH_SUBGROUP_MATRIX && !context.supports_subgroup_matrix) {
+        decisions.kv_tile   = 1u;
+        decisions.q_tile    = 1u;
+        decisions.wg_size   = 1u;
+        decisions.kv_direct = false;
+        return decisions;
+    }
+
     const ggml_webgpu_flash_attn_pipeline_key key = ggml_webgpu_flash_attn_make_pipeline_key(context, decisions.path);
     decisions.kv_direct                           = key.kv_direct;
 
